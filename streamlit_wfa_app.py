@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import json
 
 st.set_page_config(page_title="Texano's Walk Forward", layout="wide")
 
@@ -32,6 +33,8 @@ i **Net PnL** al netto delle commissioni, si estrae il giorno della settimana da
 **2. Mappatura gruppi personalizzabile**
 Ogni strategia deve appartenere a un gruppo. I gruppi possono essere rinominati, se ne possono creare
 di nuovi e ogni strategia può essere riassegnata via sidebar prima dell'elaborazione.
+La configurazione dei gruppi può essere **esportata in JSON** e **reimportata** in qualsiasi nuova
+sessione per non perdere le impostazioni dopo un refresh.
 
 **3. Omega Ratio (ranking IS)**
 Per ogni finestra In-Sample di 12 mesi, ogni strategia riceve un punteggio basato sull'**Omega Ratio**:
@@ -53,6 +56,14 @@ Le strategie qualificate vengono ordinate per Omega decrescente. Si seleziona un
 Nella finestra OOS di 28 giorni, i trade delle strategie selezionate vengono filtrati:
 i trade che si aprono in un giorno blacklistato vengono rimossi. Il Net PnL rimanente
 viene moltiplicato per il peso assegnato.
+
+---
+
+### 💾 Backup configurazione
+Per non perdere gruppi e assegnazioni dopo il refresh:
+1. Configura i tuoi gruppi nella sidebar.
+2. Clicca **📤 Esporta configurazione JSON** e salva il file `texano_config.json`.
+3. Al prossimo accesso, carica il file nella sidebar e clicca **✅ Applica configurazione JSON**.
         """)
 
 # ─── COSTANTI ────────────────────────────────────────────────────────────────
@@ -80,7 +91,7 @@ GIORNI_SETTIMANA = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom']
 DEFAULT_MAX_PER_GROUP = 2
 TOP_N = 7
 
-# ─── FUNZIONI ────────────────────────────────────────────────────────────────
+# ─── FUNZIONI CORE ───────────────────────────────────────────────────────────
 def clean_money(val):
     if pd.isna(val):
         return 0
@@ -112,9 +123,6 @@ def calculate_metrics(df):
     days = (daily_pnl.index.max() - daily_pnl.index.min()).days
     calmar = (total_pnl * (365.25 / days)) / max_dd if max_dd > 0 and days > 0 else 0
     recovery_factor = total_pnl / max_dd if max_dd > 0 else np.inf
-    avg_daily = daily_pnl.mean()
-    best_day = daily_pnl.max()
-    worst_day = daily_pnl.min()
     return {
         'Total Weighted PnL': total_pnl,
         'Total Trades': total_trades,
@@ -128,9 +136,9 @@ def calculate_metrics(df):
         'Sortino Ratio': sortino,
         'Calmar Ratio': calmar,
         'Recovery Factor': recovery_factor,
-        'Avg Daily PnL ($)': avg_daily,
-        'Best Day ($)': best_day,
-        'Worst Day ($)': worst_day,
+        'Avg Daily PnL ($)': daily_pnl.mean(),
+        'Best Day ($)': daily_pnl.max(),
+        'Worst Day ($)': daily_pnl.min(),
     }
 
 def render_metrics(m, label):
@@ -177,7 +185,41 @@ def format_banned_days(banned_list):
         return "Nessuno"
     return ", ".join([GIORNI_SETTIMANA[d] for d in banned_list if d < len(GIORNI_SETTIMANA)])
 
-# ─── UPLOAD ──────────────────────────────────────────────────────────────────
+# ─── FUNZIONI JSON CONFIG ─────────────────────────────────────────────────────
+def build_config_payload():
+    return {
+        "version": 1,
+        "group_names": st.session_state.get("group_names", []),
+        "strategy_mapping": st.session_state.get("strategy_mapping", {}),
+        "max_per_group": int(st.session_state.get("max_per_group", DEFAULT_MAX_PER_GROUP)),
+    }
+
+def apply_config_payload(payload, all_strategies):
+    if not isinstance(payload, dict):
+        raise ValueError("Il file JSON non contiene un oggetto valido.")
+    group_names = payload.get("group_names", [])
+    strategy_mapping = payload.get("strategy_mapping", {})
+    max_per_group = payload.get("max_per_group", DEFAULT_MAX_PER_GROUP)
+    if not isinstance(group_names, list):
+        raise ValueError("group_names deve essere una lista.")
+    if not isinstance(strategy_mapping, dict):
+        raise ValueError("strategy_mapping deve essere un dizionario.")
+
+    clean_groups = sorted({str(g).strip() for g in group_names if str(g).strip()})
+    clean_mapping = {str(s).strip(): str(g).strip() for s, g in strategy_mapping.items() if str(s).strip()}
+    used_groups = {g for g in clean_mapping.values() if g}
+    merged_groups = sorted(set(clean_groups) | used_groups)
+
+    current_mapping = st.session_state.get("strategy_mapping", {}).copy()
+    current_mapping.update(clean_mapping)
+    for strat in all_strategies:
+        current_mapping.setdefault(strat, "")
+
+    st.session_state["group_names"] = merged_groups
+    st.session_state["strategy_mapping"] = current_mapping
+    st.session_state["max_per_group"] = max(1, min(TOP_N, int(max_per_group)))
+
+# ─── UPLOAD CSV ───────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Carica il dataset dei trade (CSV)", type=['csv'])
 
 if uploaded_file is not None:
@@ -194,16 +236,56 @@ if uploaded_file is not None:
     if 'max_per_group' not in st.session_state:
         st.session_state['max_per_group'] = DEFAULT_MAX_PER_GROUP
 
-    # allinea gruppi con strategie nuove
     for strat in all_strategies_in_file:
         if strat not in st.session_state['strategy_mapping']:
             st.session_state['strategy_mapping'][strat] = ''
 
-    # ─── SIDEBAR CONFIG ──────────────────────────────────────────────────────
+    # ─── SIDEBAR ─────────────────────────────────────────────────────────────
     st.sidebar.header("⚙️ Configurazione Gruppi")
-    st.sidebar.markdown("Crea, rinomina e assegna gruppi; imposta anche il limite massimo per gruppo nella Top allocation.")
+    st.sidebar.markdown("Crea, rinomina e assegna gruppi; imposta il limite massimo per gruppo.")
 
-    # nuovo gruppo
+    # ── BACKUP JSON ──────────────────────────────────────────────────────────
+    st.sidebar.subheader("💾 Backup configurazione")
+    st.sidebar.caption("Esporta per salvare i tuoi gruppi. Reimporta dopo ogni refresh o reboot.")
+
+    config_json_str = json.dumps(build_config_payload(), ensure_ascii=False, indent=2)
+    st.sidebar.download_button(
+        label="📤 Esporta configurazione JSON",
+        data=config_json_str.encode("utf-8"),
+        file_name="texano_config.json",
+        mime="application/json",
+        help="Salva gruppi, assegnazioni e max per gruppo in un file JSON."
+    )
+
+    uploaded_config = st.sidebar.file_uploader(
+        "📥 Importa configurazione JSON",
+        type=["json"],
+        key="config_json_uploader",
+        help="Carica un file texano_config.json esportato in precedenza."
+    )
+    if uploaded_config is not None:
+        try:
+            parsed = json.loads(uploaded_config.getvalue().decode("utf-8"))
+            st.session_state["pending_config_payload"] = parsed
+            st.sidebar.success("✅ JSON caricato. Premi 'Applica configurazione JSON' per attivarlo.")
+        except Exception as e:
+            st.sidebar.error(f"JSON non valido: {e}")
+
+    if st.sidebar.button("✅ Applica configurazione JSON"):
+        if "pending_config_payload" not in st.session_state:
+            st.sidebar.warning("Carica prima un file JSON nella sezione qui sopra.")
+        else:
+            try:
+                apply_config_payload(st.session_state["pending_config_payload"], all_strategies_in_file)
+                del st.session_state["pending_config_payload"]
+                st.sidebar.success("Configurazione applicata con successo!")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Errore: {e}")
+
+    st.sidebar.divider()
+
+    # ── NUOVO GRUPPO ─────────────────────────────────────────────────────────
     st.sidebar.subheader("Nuovo gruppo")
     new_group_name = st.sidebar.text_input("Nome nuovo gruppo", key="new_group_name")
     if st.sidebar.button("➕ Crea gruppo"):
@@ -219,7 +301,7 @@ if uploaded_file is not None:
         else:
             st.sidebar.warning("Inserisci un nome valido")
 
-    # rinomina gruppo
+    # ── RINOMINA GRUPPO ──────────────────────────────────────────────────────
     st.sidebar.subheader("Rinomina gruppo")
     if st.session_state['group_names']:
         group_to_rename = st.sidebar.selectbox("Seleziona gruppo", options=st.session_state['group_names'], key="group_to_rename")
@@ -236,22 +318,20 @@ if uploaded_file is not None:
                 st.session_state['strategy_mapping'] = {
                     s: (new_name if g == old_name else g) for s, g in st.session_state['strategy_mapping'].items()
                 }
-                st.sidebar.success(f"Gruppo '{old_name}' rinominato in '{new_name}'")
+                st.sidebar.success(f"Gruppo '{old_name}' → '{new_name}'")
                 st.rerun()
 
-    # limite max per gruppo
+    # ── LIMITE MAX PER GRUPPO ────────────────────────────────────────────────
     st.sidebar.subheader("Limite per gruppo")
     max_per_group = st.sidebar.number_input(
         "Max strategie dello stesso gruppo in Top allocation",
-        min_value=1,
-        max_value=TOP_N,
+        min_value=1, max_value=TOP_N,
         value=st.session_state['max_per_group'],
-        step=1,
-        help="Default 2"
+        step=1, help="Default 2"
     )
     st.session_state['max_per_group'] = int(max_per_group)
 
-    # assegnazione gruppi strategie
+    # ── ASSEGNAZIONE STRATEGIE ───────────────────────────────────────────────
     st.sidebar.subheader("Assegnazione strategie")
     group_options = [''] + st.session_state['group_names']
     with st.sidebar.expander("📋 Modifica gruppo di ogni strategia", expanded=True):
@@ -259,16 +339,11 @@ if uploaded_file is not None:
         for strat in all_strategies_in_file:
             current_group = st.session_state['strategy_mapping'].get(strat, '')
             default_idx = group_options.index(current_group) if current_group in group_options else 0
-            selected_group = st.selectbox(
-                label=strat,
-                options=group_options,
-                index=default_idx,
-                key=f"group_{strat}"
-            )
+            selected_group = st.selectbox(label=strat, options=group_options, index=default_idx, key=f"group_{strat}")
             updated_mapping[strat] = selected_group
         if st.button("✅ Salva assegnazioni"):
             st.session_state['strategy_mapping'] = updated_mapping
-            st.sidebar.success("Assegnazioni aggiornate")
+            st.sidebar.success("Assegnazioni aggiornate — ricorda di esportare il JSON per salvarle!")
             st.rerun()
 
     strategy_mapping = st.session_state['strategy_mapping']
