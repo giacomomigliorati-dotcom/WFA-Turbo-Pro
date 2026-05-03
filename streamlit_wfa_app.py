@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import date
 
 st.set_page_config(page_title="Texano's Walk Forward", layout="wide")
 
@@ -20,7 +19,7 @@ if st.session_state.get("show_help", False):
         st.markdown("""
 ### 📌 Obiettivo
 Questo strumento esegue l'aggiornamento mensile di un portafoglio algoritmico **rotazionale**
-based su un motore **Walk-Forward Analysis (WFA)** con finestra rolling di 12 mesi.
+basato su un motore **Walk-Forward Analysis (WFA)** con finestra rolling di 12 mesi.
 
 ---
 
@@ -30,78 +29,66 @@ based su un motore **Walk-Forward Analysis (WFA)** con finestra rolling di 12 me
 Il CSV caricato viene pulito automaticamente: si rimuovono le strategie *Legendary*, si calcolano
 i **Net PnL** al netto delle commissioni, si estrae il giorno della settimana da ogni apertura.
 
-**2. Blocco di Sicurezza**
-Se il dataset contiene strategie non assegnate a nessuna delle 5 famiglie strategiche ammesse
-(A–E), il programma **si ferma** e chiede all'utente di assegnare la famiglia mancante tramite
-i menù a tendina nella sidebar prima di procedere.
+**2. Mappatura gruppi personalizzabile**
+Ogni strategia deve appartenere a un gruppo. I gruppi possono essere rinominati, se ne possono creare
+di nuovi e ogni strategia può essere riassegnata via sidebar prima dell'elaborazione.
 
 **3. Omega Ratio (ranking IS)**
 Per ogni finestra In-Sample di 12 mesi, ogni strategia riceve un punteggio basato sull'**Omega Ratio**:
-rapporto tra somma dei rendimenti positivi e valore assoluto dei negativi. L'Omega misura la qualità
-dell'intera distribuzione dei rendimenti, non solo media e varianza. Un Omega > 1 indica un sistema profittevole.
+rapporto tra somma dei rendimenti positivi e valore assoluto dei negativi.
 
 **4. Anomaly Detection CUSUM (Weekday Killer)**
 Per ogni combinazione strategia/giorno con almeno 10 trade nella finestra IS, viene calcolata
-una **somma cumulativa inferiore (CUSUM)**. Se la perdita cumulativa su un determinato giorno
-supera la soglia di allarme `h = 3 × std`, quel giorno viene inserito nella **Blacklist** per
-la finestra OOS successiva.
-⚠️ Regola aggiuntiva: se il CUSUM banna **tutti** i giorni su cui la strategia opera realmente,
-la strategia viene **esclusa completamente** dalla selezione.
+una **somma cumulativa inferiore (CUSUM)**. Se la perdita cumulativa supera la soglia di allarme,
+quel giorno viene inserito nella **Blacklist** per la finestra OOS successiva.
+Se il CUSUM banna **tutti** i giorni su cui la strategia opera realmente, la strategia viene esclusa.
 
-**5. Filtro Anti-Overlap e Rotazione Frazionata**
+**5. Anti-overlap configurabile**
 Le strategie qualificate vengono ordinate per Omega decrescente. Si seleziona un portafoglio
-**Core di 7 strategie (Top-7)** con un limite massimo di **2 strategie per famiglia**.
-- Rank 1–5 → Peso **100%** (Core Pieno)
-- Rank 6–7 → Peso **50%** (Panchina)
+**Top-7** con un limite massimo configurabile di strategie per lo stesso gruppo.
+- Rank 1–5 → Peso **100%**
+- Rank 6–7 → Peso **50%**
 
 **6. OOS Filtrato**
-Nella finestra OOS di 28 giorni, i trade delle 7 strategie selezionate vengono filtrati:
+Nella finestra OOS di 28 giorni, i trade delle strategie selezionate vengono filtrati:
 i trade che si aprono in un giorno blacklistato vengono rimossi. Il Net PnL rimanente
-viene moltiplicato per il peso assegnato (100% o 50%).
-
----
-
-### 📊 Output prodotti
-- **Allocazione Corrente**: tabella con rank, famiglia, Omega, peso e giorni spenti per la prossima rotazione
-- **Validità e Prossima Rotazione**: date esatte di scadenza dell'allocazione attiva
-- **Metriche OOS avanzate**: Net PnL, Max DD, Sharpe, Sortino, Calmar, Win Rate, Profit Factor, Avg Win/Loss
-- **Curve di Equity**: curva ponderata su tutto lo storico OOS e dal 1° settembre 2025
-- **Export CSV**: allocazioni storiche, trade OOS filtrati ed equity line per uso esterno
-
----
-
-### 🗂️ Famiglie Strategiche Ammesse
-| Label | Tipo |
-|---|---|
-| **A** | Iron Condor variants |
-| **B** | RIC / DCS / DSC / DC variants |
-| **C** | Short Put / Rain variants |
-| **D** | Long Call / Butterfly / Boost Up |
-| **E** | Bearish (PDown) |
+viene moltiplicato per il peso assegnato.
         """)
 
 # ─── COSTANTI ────────────────────────────────────────────────────────────────
-DEFAULT_STRATEGY_MAPPING = {
-    'Condor ZM+': 'A', 'TEST - Iron Condor delle 20:00': 'A', 'Monday Condor': 'A', 'IC Friday - Croccante (optimized)': 'A',
-    'TEST - DC 2-5': 'B', "Giusti's DCS": 'B', "Giusti's 1DSC": 'B', 'TEST - RIC by TradingMonk': 'B', "1DSC - Jack's": 'B', 'TEST - RIC from Hell': 'B',
-    'RS Rain orario uscita delta': 'C', 'TEST - Sell put 16:00': 'C', 'TEST - Sell put 20:00': 'C',
-    'Bull call VIX - Morning': 'D', 'TEST - Call butterfly': 'D', 'TEST-Boost Up for RIC': 'D',
-    'PDown w/VIX': 'E', 'TEST - PDown': 'E'
-}
-FAMIGLIE_LABELS = {
-    'A': 'A — Iron Condor', 'B': 'B — RIC / DCS / DC',
-    'C': 'C — Short Put / Rain', 'D': 'D — Long Call / Butterfly', 'E': 'E — Bearish (PDown)'
+DEFAULT_GROUP_MAPPING = {
+    'Condor ZM+': 'Iron Condor',
+    'TEST - Iron Condor delle 20:00': 'Iron Condor',
+    'Monday Condor': 'Iron Condor',
+    'IC Friday - Croccante (optimized)': 'Iron Condor',
+    'TEST - DC 2-5': 'RIC / DCS / DC',
+    "Giusti's DCS": 'RIC / DCS / DC',
+    "Giusti's 1DSC": 'RIC / DCS / DC',
+    'TEST - RIC by TradingMonk': 'RIC / DCS / DC',
+    "1DSC - Jack's": 'RIC / DCS / DC',
+    'TEST - RIC from Hell': 'RIC / DCS / DC',
+    'RS Rain orario uscita delta': 'Short Put / Rain',
+    'TEST - Sell put 16:00': 'Short Put / Rain',
+    'TEST - Sell put 20:00': 'Short Put / Rain',
+    'Bull call VIX - Morning': 'Long Call / Butterfly',
+    'TEST - Call butterfly': 'Long Call / Butterfly',
+    'TEST-Boost Up for RIC': 'Long Call / Butterfly',
+    'PDown w/VIX': 'Bearish (PDown)',
+    'TEST - PDown': 'Bearish (PDown)'
 }
 GIORNI_SETTIMANA = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom']
+DEFAULT_MAX_PER_GROUP = 2
+TOP_N = 7
 
 # ─── FUNZIONI ────────────────────────────────────────────────────────────────
 def clean_money(val):
-    if pd.isna(val): return 0
-    if isinstance(val, (int, float)): return val
+    if pd.isna(val):
+        return 0
+    if isinstance(val, (int, float)):
+        return val
     return float(str(val).replace('$', '').replace(',', ''))
 
 def calculate_metrics(df):
-    """Calcola metriche avanzate sul dataframe OOS fornito."""
     if df.empty:
         return {}
     pnl = df['Weighted Net PnL']
@@ -114,7 +101,6 @@ def calculate_metrics(df):
     avg_loss = losses.mean() if len(losses) > 0 else 0
     profit_factor = wins.sum() / abs(losses.sum()) if len(losses) > 0 and losses.sum() != 0 else np.inf
     expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
-
     daily_pnl = df.groupby(df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
     cum_pnl = daily_pnl.cumsum()
     max_dd = (cum_pnl.cummax() - cum_pnl).max()
@@ -122,14 +108,13 @@ def calculate_metrics(df):
     std_d = daily_pnl.std()
     downside = daily_pnl[daily_pnl < 0].std()
     sharpe = (mean_d / std_d) * np.sqrt(252) if std_d > 0 else 0
-    sortino = (mean_d / downside) * np.sqrt(252) if downside and downside > 0 else 0
+    sortino = (mean_d / downside) * np.sqrt(252) if pd.notna(downside) and downside > 0 else 0
     days = (daily_pnl.index.max() - daily_pnl.index.min()).days
     calmar = (total_pnl * (365.25 / days)) / max_dd if max_dd > 0 and days > 0 else 0
     recovery_factor = total_pnl / max_dd if max_dd > 0 else np.inf
     avg_daily = daily_pnl.mean()
     best_day = daily_pnl.max()
     worst_day = daily_pnl.min()
-
     return {
         'Total Weighted PnL': total_pnl,
         'Total Trades': total_trades,
@@ -196,38 +181,101 @@ def format_banned_days(banned_list):
 uploaded_file = st.file_uploader("Carica il dataset dei trade (CSV)", type=['csv'])
 
 if uploaded_file is not None:
-
     df_raw = pd.read_csv(uploaded_file)
     df_raw.columns = df_raw.columns.str.strip()
     df_raw = df_raw[~df_raw['Strategy'].astype(str).str.contains('Legendary', na=False, case=False)].copy()
     all_strategies_in_file = sorted(df_raw['Strategy'].dropna().unique().tolist())
 
-    # ─── SIDEBAR ─────────────────────────────────────────────────────────────
-    st.sidebar.header("🗂️ Assegnazione Famiglie")
-    st.sidebar.markdown("Modifica o assegna la famiglia per ogni strategia presente nel dataset.")
+    # ─── STATO SESSIONE ──────────────────────────────────────────────────────
     if 'strategy_mapping' not in st.session_state:
-        st.session_state['strategy_mapping'] = DEFAULT_STRATEGY_MAPPING.copy()
-    unmapped_detected = [s for s in all_strategies_in_file if s not in st.session_state['strategy_mapping']]
-    if unmapped_detected:
-        st.sidebar.warning(f"⚠️ Strategie senza famiglia: {', '.join(unmapped_detected)}")
-    famiglia_options = list(FAMIGLIE_LABELS.keys())
-    famiglia_display = list(FAMIGLIE_LABELS.values())
-    with st.sidebar.expander("📋 Modifica mappatura strategie", expanded=bool(unmapped_detected)):
+        st.session_state['strategy_mapping'] = DEFAULT_GROUP_MAPPING.copy()
+    if 'group_names' not in st.session_state:
+        st.session_state['group_names'] = sorted(set(DEFAULT_GROUP_MAPPING.values()))
+    if 'max_per_group' not in st.session_state:
+        st.session_state['max_per_group'] = DEFAULT_MAX_PER_GROUP
+
+    # allinea gruppi con strategie nuove
+    for strat in all_strategies_in_file:
+        if strat not in st.session_state['strategy_mapping']:
+            st.session_state['strategy_mapping'][strat] = ''
+
+    # ─── SIDEBAR CONFIG ──────────────────────────────────────────────────────
+    st.sidebar.header("⚙️ Configurazione Gruppi")
+    st.sidebar.markdown("Crea, rinomina e assegna gruppi; imposta anche il limite massimo per gruppo nella Top allocation.")
+
+    # nuovo gruppo
+    st.sidebar.subheader("Nuovo gruppo")
+    new_group_name = st.sidebar.text_input("Nome nuovo gruppo", key="new_group_name")
+    if st.sidebar.button("➕ Crea gruppo"):
+        clean_name = new_group_name.strip()
+        if clean_name:
+            if clean_name not in st.session_state['group_names']:
+                st.session_state['group_names'].append(clean_name)
+                st.session_state['group_names'] = sorted(st.session_state['group_names'])
+                st.sidebar.success(f"Gruppo '{clean_name}' creato")
+                st.rerun()
+            else:
+                st.sidebar.warning("Questo gruppo esiste già")
+        else:
+            st.sidebar.warning("Inserisci un nome valido")
+
+    # rinomina gruppo
+    st.sidebar.subheader("Rinomina gruppo")
+    if st.session_state['group_names']:
+        group_to_rename = st.sidebar.selectbox("Seleziona gruppo", options=st.session_state['group_names'], key="group_to_rename")
+        renamed_group = st.sidebar.text_input("Nuovo nome", key="renamed_group")
+        if st.sidebar.button("✏️ Rinomina gruppo"):
+            old_name = group_to_rename
+            new_name = renamed_group.strip()
+            if not new_name:
+                st.sidebar.warning("Inserisci un nuovo nome valido")
+            elif new_name in st.session_state['group_names'] and new_name != old_name:
+                st.sidebar.warning("Esiste già un gruppo con questo nome")
+            else:
+                st.session_state['group_names'] = [new_name if g == old_name else g for g in st.session_state['group_names']]
+                st.session_state['strategy_mapping'] = {
+                    s: (new_name if g == old_name else g) for s, g in st.session_state['strategy_mapping'].items()
+                }
+                st.sidebar.success(f"Gruppo '{old_name}' rinominato in '{new_name}'")
+                st.rerun()
+
+    # limite max per gruppo
+    st.sidebar.subheader("Limite per gruppo")
+    max_per_group = st.sidebar.number_input(
+        "Max strategie dello stesso gruppo in Top allocation",
+        min_value=1,
+        max_value=TOP_N,
+        value=st.session_state['max_per_group'],
+        step=1,
+        help="Default 2"
+    )
+    st.session_state['max_per_group'] = int(max_per_group)
+
+    # assegnazione gruppi strategie
+    st.sidebar.subheader("Assegnazione strategie")
+    group_options = [''] + st.session_state['group_names']
+    with st.sidebar.expander("📋 Modifica gruppo di ogni strategia", expanded=True):
         updated_mapping = {}
         for strat in all_strategies_in_file:
-            current_fam = st.session_state['strategy_mapping'].get(strat, None)
-            default_idx = famiglia_options.index(current_fam) if current_fam in famiglia_options else 0
-            sel = st.selectbox(label=strat, options=famiglia_display, index=default_idx, key=f"fam_{strat}")
-            updated_mapping[strat] = famiglia_options[famiglia_display.index(sel)]
-        if st.button("✅ Salva mappatura"):
+            current_group = st.session_state['strategy_mapping'].get(strat, '')
+            default_idx = group_options.index(current_group) if current_group in group_options else 0
+            selected_group = st.selectbox(
+                label=strat,
+                options=group_options,
+                index=default_idx,
+                key=f"group_{strat}"
+            )
+            updated_mapping[strat] = selected_group
+        if st.button("✅ Salva assegnazioni"):
             st.session_state['strategy_mapping'] = updated_mapping
-            st.sidebar.success("Mappatura aggiornata!")
+            st.sidebar.success("Assegnazioni aggiornate")
             st.rerun()
+
     strategy_mapping = st.session_state['strategy_mapping']
-    still_unmapped = [s for s in all_strategies_in_file if s not in strategy_mapping]
+    still_unmapped = [s for s in all_strategies_in_file if not strategy_mapping.get(s, '').strip()]
     if still_unmapped:
-        st.error(f"🛑 BLOCCO DI SICUREZZA: Strategie senza famiglia: {', '.join(still_unmapped)}")
-        st.info("Apri la sidebar (▶) e assegna una famiglia, poi clicca 'Salva mappatura'.")
+        st.error(f"🛑 BLOCCO DI SICUREZZA: Strategie senza gruppo assegnato: {', '.join(still_unmapped)}")
+        st.info("Apri la sidebar (▶), assegna un gruppo a ogni strategia e salva le assegnazioni.")
         st.stop()
 
     # ─── WFA ENGINE ──────────────────────────────────────────────────────────
@@ -241,27 +289,30 @@ if uploaded_file is not None:
             lambda x: float(str(x).replace('%', '').replace(',', '')) if pd.notna(x) else np.nan)
         df_filtered['Opening Commissions + Fees'] = df_filtered['Opening Commissions + Fees'].fillna(0).apply(clean_money)
         df_filtered['Closing Commissions + Fees'] = df_filtered['Closing Commissions + Fees'].fillna(0).apply(clean_money)
-        df_filtered['Net PnL'] = (df_filtered['P/L']
-            - df_filtered['Opening Commissions + Fees']
-            - df_filtered['Closing Commissions + Fees'])
+        df_filtered['Net PnL'] = (
+            df_filtered['P/L'] - df_filtered['Opening Commissions + Fees'] - df_filtered['Closing Commissions + Fees']
+        )
         df_filtered = df_filtered.sort_values('Date Closed').reset_index(drop=True)
+
         min_date = df_filtered['Date Closed'].min()
         max_date = df_filtered['Date Closed'].max()
         current_oos_start = min_date + pd.DateOffset(months=12)
         oos_results, historical_allocations, cusum_exclusions_log = [], [], []
-        last_oos_end = None
 
         while current_oos_start <= max_date:
             current_oos_end = current_oos_start + pd.Timedelta(days=28)
             current_is_start = current_oos_start - pd.DateOffset(months=12)
             is_data = df_filtered[(df_filtered['Date Closed'] >= current_is_start) & (df_filtered['Date Closed'] < current_oos_start)].copy()
             oos_data = df_filtered[(df_filtered['Date Closed'] >= current_oos_start) & (df_filtered['Date Closed'] < current_oos_end)].copy()
+
             if is_data.empty:
                 current_oos_start = current_oos_end
                 continue
+
             valid_strats = is_data['Strategy'].value_counts()
             valid_strats = valid_strats[valid_strats >= 5].index.tolist()
             is_metrics = []
+
             for strat in valid_strats:
                 strat_is = is_data[is_data['Strategy'] == strat].copy()
                 if strat_is['P/L %'].notna().sum() > 0:
@@ -274,62 +325,87 @@ if uploaded_file is not None:
                 banned_days = compute_cusum_banned(strat_is)
                 active_days = strat_is['weekday_open'].unique().tolist()
                 remaining = [d for d in active_days if d not in banned_days]
+
                 if not remaining:
-                    cusum_exclusions_log.append({'OOS Start': current_oos_start, 'Strategy': strat,
-                        'Motivo': f"Tutti i giorni operativi bannati: {format_banned_days(banned_days)}"})
+                    cusum_exclusions_log.append({
+                        'OOS Start': current_oos_start,
+                        'Strategy': strat,
+                        'Motivo': f"Tutti i giorni operativi bannati: {format_banned_days(banned_days)}"
+                    })
                     continue
-                is_metrics.append({'Strategy': strat, 'Family': strategy_mapping[strat],
-                    'Omega': omega, 'Net PnL IS': strat_is['Net PnL'].sum(), 'Banned Days': banned_days})
+
+                is_metrics.append({
+                    'Strategy': strat,
+                    'Group': strategy_mapping[strat],
+                    'Omega': omega,
+                    'Net PnL IS': strat_is['Net PnL'].sum(),
+                    'Banned Days': banned_days
+                })
+
             is_metrics_df = pd.DataFrame(is_metrics)
             if not is_metrics_df.empty:
                 is_metrics_df = is_metrics_df.sort_values(['Omega', 'Net PnL IS'], ascending=[False, False])
-                selected_strategies, family_counts = [], {f: 0 for f in set(strategy_mapping.values())}
+                selected_strategies = []
+                group_counts = {}
+
                 for _, row in is_metrics_df.iterrows():
-                    if len(selected_strategies) >= 7: break
-                    if family_counts.get(row['Family'], 0) < 2:
+                    if len(selected_strategies) >= TOP_N:
+                        break
+                    grp = row['Group']
+                    if group_counts.get(grp, 0) < st.session_state['max_per_group']:
                         selected_strategies.append(row)
-                        family_counts[row['Family']] = family_counts.get(row['Family'], 0) + 1
+                        group_counts[grp] = group_counts.get(grp, 0) + 1
+
                 for rank, strat_row in enumerate(selected_strategies):
                     weight = 1.0 if rank < 5 else 0.5
                     strat_name, banned = strat_row['Strategy'], strat_row['Banned Days']
-                    historical_allocations.append({'OOS Start': current_oos_start, 'OOS End': current_oos_end,
-                        'Rank': rank + 1, 'Strategy': strat_name, 'Family': strat_row['Family'],
-                        'Omega IS': strat_row['Omega'], 'Weight': weight, 'Banned Days': banned})
+                    historical_allocations.append({
+                        'OOS Start': current_oos_start,
+                        'OOS End': current_oos_end,
+                        'Rank': rank + 1,
+                        'Strategy': strat_name,
+                        'Group': strat_row['Group'],
+                        'Omega IS': strat_row['Omega'],
+                        'Weight': weight,
+                        'Banned Days': banned,
+                        'Max Per Group': st.session_state['max_per_group']
+                    })
                     strat_oos = oos_data[oos_data['Strategy'] == strat_name].copy()
                     if not strat_oos.empty:
                         strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned)]
                         strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
                         oos_results.append(strat_oos)
-                last_oos_end = current_oos_end
+
             current_oos_start = current_oos_end
 
         if not oos_results:
             st.error("Nessun trade OOS generato. Verifica che il dataset copra almeno 13 mesi di storia.")
             st.stop()
+
         final_oos_df = pd.concat(oos_results).sort_values('Date Closed').reset_index(drop=True)
         hist_alloc_df = pd.DataFrame(historical_allocations)
         exclusions_df = pd.DataFrame(cusum_exclusions_log)
 
     st.success('Elaborazione completata!')
 
-    # ─── 1. ALLOCAZIONE CORRENTE + VALIDITÀ ──────────────────────────────────
+    # ─── 1. ALLOCAZIONE CORRENTE ─────────────────────────────────────────────
     st.header("1. Allocazione Corrente")
     latest_start = hist_alloc_df['OOS Start'].max()
     latest_end = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start]['OOS End'].iloc[0]
     today = pd.Timestamp.today().normalize()
     days_left = (latest_end - today).days
 
-    # Banner validità
-    val_col1, val_col2, val_col3 = st.columns(3)
+    val_col1, val_col2, val_col3, val_col4 = st.columns(4)
     val_col1.info(f"📅 **Allocazione attiva dal:** {latest_start.strftime('%d %b %Y')}")
     val_col2.info(f"🔚 **Valida fino al:** {latest_end.strftime('%d %b %Y')}")
     if days_left > 0:
         val_col3.warning(f"⏳ **Prossima rotazione tra:** {days_left} giorni ({latest_end.strftime('%d %b %Y')})")
     else:
-        val_col3.error(f"🔄 **Rotazione scaduta** — aggiorna il CSV per ricalcolare l'allocazione")
+        val_col3.error("🔄 **Rotazione scaduta** — aggiorna il CSV")
+    val_col4.info(f"🧩 **Max per gruppo:** {st.session_state['max_per_group']}")
 
     latest_alloc = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start].copy()
-    disp = latest_alloc[['Rank', 'Strategy', 'Family', 'Omega IS', 'Weight', 'Banned Days']].copy()
+    disp = latest_alloc[['Rank', 'Strategy', 'Group', 'Omega IS', 'Weight', 'Banned Days']].copy()
     disp['Weight'] = (disp['Weight'] * 100).astype(int).astype(str) + '%'
     disp['Omega IS'] = disp['Omega IS'].round(4)
     disp['Giorni Spenti (CUSUM)'] = disp['Banned Days'].apply(format_banned_days)
@@ -342,7 +418,7 @@ if uploaded_file is not None:
             st.warning("⚠️ Strategie escluse perché CUSUM ha bannato tutti i loro giorni operativi:")
             st.dataframe(latest_excl[['Strategy', 'Motivo']], use_container_width=True, hide_index=True)
 
-    # ─── 2. METRICHE OOS AVANZATE ────────────────────────────────────────────
+    # ─── 2. METRICHE OOS ─────────────────────────────────────────────────────
     st.header("2. Metriche Out-Of-Sample")
     tab_global, tab_recent = st.tabs(["📊 Storico Completo OOS", "📈 Dal 1° Settembre 2025"])
     with tab_global:
@@ -351,27 +427,24 @@ if uploaded_file is not None:
         recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
         render_metrics(calculate_metrics(recent_df), "Metriche — Dal 1° Settembre 2025")
 
-    # ─── 3. EQUITY — STORICO COMPLETO ────────────────────────────────────────
+    # ─── 3. EQUITY COMPLETA ──────────────────────────────────────────────────
     st.header("3. Curva Equity — Storico Completo OOS")
     all_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
     all_cum = all_daily.cumsum()
     fig_all = go.Figure()
-    fig_all.add_trace(go.Scatter(x=all_cum.index, y=all_cum.values, mode='lines', fill='tozeroy',
-        line=dict(color='#00b4d8')))
-    fig_all.update_layout(title="Equity Cumulativa WFA — Storico Completo",
-        xaxis_title="Data", yaxis_title="Net PnL ($)", margin=dict(l=40, r=40, t=50, b=40))
+    fig_all.add_trace(go.Scatter(x=all_cum.index, y=all_cum.values, mode='lines', fill='tozeroy', line=dict(color='#00b4d8')))
+    fig_all.update_layout(title="Equity Cumulativa WFA — Storico Completo", xaxis_title="Data", yaxis_title="Net PnL ($)")
     st.plotly_chart(fig_all, use_container_width=True)
 
-    # ─── 4. EQUITY — DAL 1 SET 2025 ──────────────────────────────────────────
+    # ─── 4. EQUITY RECENTE ───────────────────────────────────────────────────
     st.header("4. Curva Equity — Dal 1° Settembre 2025")
+    recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
     if not recent_df.empty:
         rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
         rec_cum = rec_daily.cumsum()
         fig_rec = go.Figure()
-        fig_rec.add_trace(go.Scatter(x=rec_cum.index, y=rec_cum.values, mode='lines', fill='tozeroy',
-            line=dict(color='#f77f00')))
-        fig_rec.update_layout(title="Equity Cumulativa WFA — Dal 1° Settembre 2025",
-            xaxis_title="Data", yaxis_title="Net PnL ($)", margin=dict(l=40, r=40, t=50, b=40))
+        fig_rec.add_trace(go.Scatter(x=rec_cum.index, y=rec_cum.values, mode='lines', fill='tozeroy', line=dict(color='#f77f00')))
+        fig_rec.update_layout(title="Equity Cumulativa WFA — Dal 1° Settembre 2025", xaxis_title="Data", yaxis_title="Net PnL ($)")
         st.plotly_chart(fig_rec, use_container_width=True)
     else:
         st.info("Nessun dato OOS disponibile dal 1° settembre 2025.")
@@ -379,40 +452,19 @@ if uploaded_file is not None:
     # ─── 5. EXPORT ───────────────────────────────────────────────────────────
     st.header("5. Esporta Dati")
     hist_export = hist_alloc_df.copy()
-    hist_export['Banned Days'] = hist_export['Banned Days'].apply(
-        lambda x: format_banned_days(x) if isinstance(x, list) else x)
-
-    # Equity line CSV (storico completo)
-    equity_csv_df = pd.DataFrame({
-        'Date': all_cum.index,
-        'Daily PnL': all_daily.values,
-        'Cumulative PnL': all_cum.values
-    })
-    # Equity line CSV (dal 1 set 2025)
+    hist_export['Banned Days'] = hist_export['Banned Days'].apply(lambda x: format_banned_days(x) if isinstance(x, list) else x)
+    equity_csv_df = pd.DataFrame({'Date': all_cum.index, 'Daily PnL': all_daily.values, 'Cumulative PnL': all_cum.values})
+    equity_recent_csv_df = pd.DataFrame()
     if not recent_df.empty:
-        equity_recent_csv_df = pd.DataFrame({
-            'Date': rec_cum.index,
-            'Daily PnL': rec_daily.values,
-            'Cumulative PnL': rec_cum.values
-        })
-    else:
-        equity_recent_csv_df = pd.DataFrame()
+        equity_recent_csv_df = pd.DataFrame({'Date': rec_cum.index, 'Daily PnL': rec_daily.values, 'Cumulative PnL': rec_cum.values})
 
     col_b1, col_b2, col_b3, col_b4 = st.columns(4)
     with col_b1:
-        st.download_button("📥 Allocazioni Storiche",
-            data=hist_export.to_csv(index=False).encode('utf-8'),
-            file_name="wfa_allocations.csv", mime="text/csv")
+        st.download_button("📥 Allocazioni Storiche", data=hist_export.to_csv(index=False).encode('utf-8'), file_name="wfa_allocations.csv", mime="text/csv")
     with col_b2:
-        st.download_button("📥 Trade OOS Filtrati",
-            data=final_oos_df.to_csv(index=False).encode('utf-8'),
-            file_name="wfa_oos_trades.csv", mime="text/csv")
+        st.download_button("📥 Trade OOS Filtrati", data=final_oos_df.to_csv(index=False).encode('utf-8'), file_name="wfa_oos_trades.csv", mime="text/csv")
     with col_b3:
-        st.download_button("📥 Equity Line Completa",
-            data=equity_csv_df.to_csv(index=False).encode('utf-8'),
-            file_name="equity_full.csv", mime="text/csv")
+        st.download_button("📥 Equity Line Completa", data=equity_csv_df.to_csv(index=False).encode('utf-8'), file_name="equity_full.csv", mime="text/csv")
     with col_b4:
         if not equity_recent_csv_df.empty:
-            st.download_button("📥 Equity Line Set 2025+",
-                data=equity_recent_csv_df.to_csv(index=False).encode('utf-8'),
-                file_name="equity_sep2025.csv", mime="text/csv")
+            st.download_button("📥 Equity Line Set 2025+", data=equity_recent_csv_df.to_csv(index=False).encode('utf-8'), file_name="equity_sep2025.csv", mime="text/csv")
