@@ -6,6 +6,205 @@ import json
 
 st.set_page_config(page_title="Texano's Walk Forward", layout="wide")
 
+# ─── OZONE THEME CSS ─────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+/* ── ROOT PALETTE ── */
+:root {
+  --oz-bg:        #0d1117;
+  --oz-panel:     #1a2332;
+  --oz-panel2:    #1e2d42;
+  --oz-border:    #2a3f5f;
+  --oz-cyan:      #00d4ff;
+  --oz-cyan-dim:  #0099bb;
+  --oz-blue:      #3b82f6;
+  --oz-amber:     #f59e0b;
+  --oz-red:       #ef4444;
+  --oz-green:     #22c55e;
+  --oz-text:      #e0eaf4;
+  --oz-muted:     #7a9abf;
+}
+
+/* ── GLOBAL ── */
+html, body, [class*="css"] {
+  font-family: 'Inter', 'Segoe UI', sans-serif !important;
+  background-color: var(--oz-bg) !important;
+  color: var(--oz-text) !important;
+}
+
+/* ── APP BACKGROUND ── */
+.stApp, .main .block-container {
+  background-color: var(--oz-bg) !important;
+}
+
+/* ── TITOLO PRINCIPALE ── */
+h1 {
+  font-size: 2rem !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.5px;
+  background: linear-gradient(90deg, #00d4ff 0%, #3b82f6 60%, #818cf8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  padding-bottom: 4px;
+}
+
+/* ── H2 / H3 HEADERS ── */
+h2 {
+  color: var(--oz-cyan) !important;
+  font-weight: 600 !important;
+  border-bottom: 1px solid var(--oz-border);
+  padding-bottom: 6px;
+  margin-bottom: 12px;
+}
+h3 {
+  color: #7dd3fc !important;
+  font-weight: 500 !important;
+}
+
+/* ── SIDEBAR ── */
+[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {
+  background-color: #101820 !important;
+  border-right: 1px solid var(--oz-border) !important;
+}
+[data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+  color: var(--oz-cyan) !important;
+  font-size: 0.85rem !important;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+/* ── METRICS ── */
+[data-testid="stMetric"] {
+  background: var(--oz-panel) !important;
+  border: 1px solid var(--oz-border) !important;
+  border-radius: 8px !important;
+  padding: 14px 16px !important;
+}
+[data-testid="stMetricLabel"] {
+  color: var(--oz-muted) !important;
+  font-size: 0.72rem !important;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+[data-testid="stMetricValue"] {
+  color: var(--oz-cyan) !important;
+  font-size: 1.35rem !important;
+  font-weight: 700 !important;
+}
+
+/* ── DATAFRAME / TABLE ── */
+[data-testid="stDataFrame"] {
+  border: 1px solid var(--oz-border) !important;
+  border-radius: 8px !important;
+  overflow: hidden;
+}
+
+/* ── BUTTONS ── */
+.stButton > button, [data-testid="baseButton-secondary"] {
+  background: linear-gradient(135deg, #0d2a3f 0%, #0d1f30 100%) !important;
+  border: 1px solid var(--oz-cyan-dim) !important;
+  color: var(--oz-cyan) !important;
+  border-radius: 6px !important;
+  font-weight: 500 !important;
+  font-family: 'Inter', sans-serif !important;
+  letter-spacing: 0.03em;
+  transition: all 0.15s ease;
+}
+.stButton > button:hover {
+  background: linear-gradient(135deg, #0d3a55 0%, #0d2d44 100%) !important;
+  border-color: var(--oz-cyan) !important;
+  box-shadow: 0 0 10px rgba(0, 212, 255, 0.25) !important;
+}
+
+/* ── DOWNLOAD BUTTONS ── */
+[data-testid="stDownloadButton"] > button {
+  background: linear-gradient(135deg, #1a3a52 0%, #122840 100%) !important;
+  border: 1px solid var(--oz-blue) !important;
+  color: #93c5fd !important;
+  border-radius: 6px !important;
+  font-weight: 500 !important;
+}
+[data-testid="stDownloadButton"] > button:hover {
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.3) !important;
+}
+
+/* ── FILE UPLOADER ── */
+[data-testid="stFileUploader"] {
+  border: 1px dashed var(--oz-border) !important;
+  border-radius: 8px !important;
+  background: var(--oz-panel) !important;
+  padding: 6px;
+}
+
+/* ── EXPANDER ── */
+[data-testid="stExpander"] {
+  border: 1px solid var(--oz-border) !important;
+  border-radius: 8px !important;
+  background: var(--oz-panel) !important;
+}
+
+/* ── INFO / WARNING / ERROR BOXES ── */
+[data-testid="stAlert"][data-baseweb="notification"] {
+  border-radius: 8px !important;
+}
+.stInfo {
+  background: rgba(0, 212, 255, 0.08) !important;
+  border-left: 3px solid var(--oz-cyan) !important;
+}
+.stWarning {
+  background: rgba(245, 158, 11, 0.10) !important;
+  border-left: 3px solid var(--oz-amber) !important;
+}
+.stError {
+  background: rgba(239, 68, 68, 0.10) !important;
+  border-left: 3px solid var(--oz-red) !important;
+}
+.stSuccess {
+  background: rgba(34, 197, 94, 0.08) !important;
+  border-left: 3px solid var(--oz-green) !important;
+}
+
+/* ── SELECTBOX / INPUT ── */
+[data-testid="stSelectbox"] > div > div,
+[data-testid="stNumberInput"] > div > div > input,
+[data-testid="stTextInput"] > div > div > input {
+  background-color: var(--oz-panel2) !important;
+  border: 1px solid var(--oz-border) !important;
+  color: var(--oz-text) !important;
+  border-radius: 6px !important;
+}
+
+/* ── TABS ── */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+  border-bottom: 1px solid var(--oz-border) !important;
+  background: transparent !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+  color: var(--oz-muted) !important;
+  font-weight: 500 !important;
+  font-family: 'Inter', sans-serif !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+  color: var(--oz-cyan) !important;
+  border-bottom: 2px solid var(--oz-cyan) !important;
+}
+
+/* ── SPINNER ── */
+[data-testid="stSpinner"] > div {
+  border-top-color: var(--oz-cyan) !important;
+}
+
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--oz-bg); }
+::-webkit-scrollbar-thumb { background: var(--oz-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--oz-cyan-dim); }
+</style>
+""", unsafe_allow_html=True)
+
 # ─── TITOLO + PULSANTE ? ─────────────────────────────────────────────────────
 col_title, col_help = st.columns([10, 1])
 with col_title:
@@ -90,6 +289,16 @@ DEFAULT_GROUP_MAPPING = {
 GIORNI_SETTIMANA = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom']
 DEFAULT_MAX_PER_GROUP = 2
 TOP_N = 7
+
+# Plotly Ozone layout base
+OZONE_LAYOUT = dict(
+    plot_bgcolor='#0d1117',
+    paper_bgcolor='#0d1117',
+    font=dict(family='Inter, Segoe UI, sans-serif', color='#e0eaf4', size=12),
+    xaxis=dict(gridcolor='#2a3f5f', linecolor='#2a3f5f', zerolinecolor='#2a3f5f'),
+    yaxis=dict(gridcolor='#2a3f5f', linecolor='#2a3f5f', zerolinecolor='#2a3f5f'),
+    margin=dict(l=50, r=30, t=60, b=50),
+)
 
 # ─── FUNZIONI CORE ───────────────────────────────────────────────────────────
 def clean_money(val):
@@ -185,7 +394,7 @@ def format_banned_days(banned_list):
         return "Nessuno"
     return ", ".join([GIORNI_SETTIMANA[d] for d in banned_list if d < len(GIORNI_SETTIMANA)])
 
-# ─── FUNZIONI JSON CONFIG ─────────────────────────────────────────────────────
+# ─── FUNZIONI JSON CONFIG ────────────────────────────────────────────────────
 def build_config_payload():
     return {
         "version": 1,
@@ -204,22 +413,19 @@ def apply_config_payload(payload, all_strategies):
         raise ValueError("group_names deve essere una lista.")
     if not isinstance(strategy_mapping, dict):
         raise ValueError("strategy_mapping deve essere un dizionario.")
-
     clean_groups = sorted({str(g).strip() for g in group_names if str(g).strip()})
     clean_mapping = {str(s).strip(): str(g).strip() for s, g in strategy_mapping.items() if str(s).strip()}
     used_groups = {g for g in clean_mapping.values() if g}
     merged_groups = sorted(set(clean_groups) | used_groups)
-
     current_mapping = st.session_state.get("strategy_mapping", {}).copy()
     current_mapping.update(clean_mapping)
     for strat in all_strategies:
         current_mapping.setdefault(strat, "")
-
     st.session_state["group_names"] = merged_groups
     st.session_state["strategy_mapping"] = current_mapping
     st.session_state["max_per_group"] = max(1, min(TOP_N, int(max_per_group)))
 
-# ─── UPLOAD CSV ───────────────────────────────────────────────────────────────
+# ─── UPLOAD CSV ──────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Carica il dataset dei trade (CSV)", type=['csv'])
 
 if uploaded_file is not None:
@@ -235,7 +441,6 @@ if uploaded_file is not None:
         st.session_state['group_names'] = sorted(set(DEFAULT_GROUP_MAPPING.values()))
     if 'max_per_group' not in st.session_state:
         st.session_state['max_per_group'] = DEFAULT_MAX_PER_GROUP
-
     for strat in all_strategies_in_file:
         if strat not in st.session_state['strategy_mapping']:
             st.session_state['strategy_mapping'][strat] = ''
@@ -247,7 +452,6 @@ if uploaded_file is not None:
     # ── BACKUP JSON ──────────────────────────────────────────────────────────
     st.sidebar.subheader("💾 Backup configurazione")
     st.sidebar.caption("Esporta per salvare i tuoi gruppi. Reimporta dopo ogni refresh o reboot.")
-
     config_json_str = json.dumps(build_config_payload(), ensure_ascii=False, indent=2)
     st.sidebar.download_button(
         label="📤 Esporta configurazione JSON",
@@ -256,7 +460,6 @@ if uploaded_file is not None:
         mime="application/json",
         help="Salva gruppi, assegnazioni e max per gruppo in un file JSON."
     )
-
     uploaded_config = st.sidebar.file_uploader(
         "📥 Importa configurazione JSON",
         type=["json"],
@@ -270,7 +473,6 @@ if uploaded_file is not None:
             st.sidebar.success("✅ JSON caricato. Premi 'Applica configurazione JSON' per attivarlo.")
         except Exception as e:
             st.sidebar.error(f"JSON non valido: {e}")
-
     if st.sidebar.button("✅ Applica configurazione JSON"):
         if "pending_config_payload" not in st.session_state:
             st.sidebar.warning("Carica prima un file JSON nella sezione qui sopra.")
@@ -301,7 +503,7 @@ if uploaded_file is not None:
         else:
             st.sidebar.warning("Inserisci un nome valido")
 
-    # ── RINOMINA GRUPPO ──────────────────────────────────────────────────────
+    # ── RINOMINA GRUPPO ───────────────────────────────────────────────────────
     st.sidebar.subheader("Rinomina gruppo")
     if st.session_state['group_names']:
         group_to_rename = st.sidebar.selectbox("Seleziona gruppo", options=st.session_state['group_names'], key="group_to_rename")
@@ -321,7 +523,7 @@ if uploaded_file is not None:
                 st.sidebar.success(f"Gruppo '{old_name}' → '{new_name}'")
                 st.rerun()
 
-    # ── LIMITE MAX PER GRUPPO ────────────────────────────────────────────────
+    # ── LIMITE MAX PER GRUPPO ─────────────────────────────────────────────────
     st.sidebar.subheader("Limite per gruppo")
     max_per_group = st.sidebar.number_input(
         "Max strategie dello stesso gruppo in Top allocation",
@@ -331,7 +533,7 @@ if uploaded_file is not None:
     )
     st.session_state['max_per_group'] = int(max_per_group)
 
-    # ── ASSEGNAZIONE STRATEGIE ───────────────────────────────────────────────
+    # ── ASSEGNAZIONE STRATEGIE ────────────────────────────────────────────────
     st.sidebar.subheader("Assegnazione strategie")
     group_options = [''] + st.session_state['group_names']
     with st.sidebar.expander("📋 Modifica gruppo di ogni strategia", expanded=True):
@@ -368,7 +570,6 @@ if uploaded_file is not None:
             df_filtered['P/L'] - df_filtered['Opening Commissions + Fees'] - df_filtered['Closing Commissions + Fees']
         )
         df_filtered = df_filtered.sort_values('Date Closed').reset_index(drop=True)
-
         min_date = df_filtered['Date Closed'].min()
         max_date = df_filtered['Date Closed'].max()
         current_oos_start = min_date + pd.DateOffset(months=12)
@@ -379,15 +580,12 @@ if uploaded_file is not None:
             current_is_start = current_oos_start - pd.DateOffset(months=12)
             is_data = df_filtered[(df_filtered['Date Closed'] >= current_is_start) & (df_filtered['Date Closed'] < current_oos_start)].copy()
             oos_data = df_filtered[(df_filtered['Date Closed'] >= current_oos_start) & (df_filtered['Date Closed'] < current_oos_end)].copy()
-
             if is_data.empty:
                 current_oos_start = current_oos_end
                 continue
-
             valid_strats = is_data['Strategy'].value_counts()
             valid_strats = valid_strats[valid_strats >= 5].index.tolist()
             is_metrics = []
-
             for strat in valid_strats:
                 strat_is = is_data[is_data['Strategy'] == strat].copy()
                 if strat_is['P/L %'].notna().sum() > 0:
@@ -400,29 +598,16 @@ if uploaded_file is not None:
                 banned_days = compute_cusum_banned(strat_is)
                 active_days = strat_is['weekday_open'].unique().tolist()
                 remaining = [d for d in active_days if d not in banned_days]
-
                 if not remaining:
-                    cusum_exclusions_log.append({
-                        'OOS Start': current_oos_start,
-                        'Strategy': strat,
-                        'Motivo': f"Tutti i giorni operativi bannati: {format_banned_days(banned_days)}"
-                    })
+                    cusum_exclusions_log.append({'OOS Start': current_oos_start, 'Strategy': strat,
+                        'Motivo': f"Tutti i giorni operativi bannati: {format_banned_days(banned_days)}"})
                     continue
-
-                is_metrics.append({
-                    'Strategy': strat,
-                    'Group': strategy_mapping[strat],
-                    'Omega': omega,
-                    'Net PnL IS': strat_is['Net PnL'].sum(),
-                    'Banned Days': banned_days
-                })
-
+                is_metrics.append({'Strategy': strat, 'Group': strategy_mapping[strat],
+                    'Omega': omega, 'Net PnL IS': strat_is['Net PnL'].sum(), 'Banned Days': banned_days})
             is_metrics_df = pd.DataFrame(is_metrics)
             if not is_metrics_df.empty:
                 is_metrics_df = is_metrics_df.sort_values(['Omega', 'Net PnL IS'], ascending=[False, False])
-                selected_strategies = []
-                group_counts = {}
-
+                selected_strategies, group_counts = [], {}
                 for _, row in is_metrics_df.iterrows():
                     if len(selected_strategies) >= TOP_N:
                         break
@@ -430,33 +615,23 @@ if uploaded_file is not None:
                     if group_counts.get(grp, 0) < st.session_state['max_per_group']:
                         selected_strategies.append(row)
                         group_counts[grp] = group_counts.get(grp, 0) + 1
-
                 for rank, strat_row in enumerate(selected_strategies):
                     weight = 1.0 if rank < 5 else 0.5
                     strat_name, banned = strat_row['Strategy'], strat_row['Banned Days']
-                    historical_allocations.append({
-                        'OOS Start': current_oos_start,
-                        'OOS End': current_oos_end,
-                        'Rank': rank + 1,
-                        'Strategy': strat_name,
-                        'Group': strat_row['Group'],
-                        'Omega IS': strat_row['Omega'],
-                        'Weight': weight,
-                        'Banned Days': banned,
-                        'Max Per Group': st.session_state['max_per_group']
-                    })
+                    historical_allocations.append({'OOS Start': current_oos_start, 'OOS End': current_oos_end,
+                        'Rank': rank + 1, 'Strategy': strat_name, 'Group': strat_row['Group'],
+                        'Omega IS': strat_row['Omega'], 'Weight': weight, 'Banned Days': banned,
+                        'Max Per Group': st.session_state['max_per_group']})
                     strat_oos = oos_data[oos_data['Strategy'] == strat_name].copy()
                     if not strat_oos.empty:
                         strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned)]
                         strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
                         oos_results.append(strat_oos)
-
             current_oos_start = current_oos_end
 
         if not oos_results:
             st.error("Nessun trade OOS generato. Verifica che il dataset copra almeno 13 mesi di storia.")
             st.stop()
-
         final_oos_df = pd.concat(oos_results).sort_values('Date Closed').reset_index(drop=True)
         hist_alloc_df = pd.DataFrame(historical_allocations)
         exclusions_df = pd.DataFrame(cusum_exclusions_log)
@@ -507,8 +682,13 @@ if uploaded_file is not None:
     all_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
     all_cum = all_daily.cumsum()
     fig_all = go.Figure()
-    fig_all.add_trace(go.Scatter(x=all_cum.index, y=all_cum.values, mode='lines', fill='tozeroy', line=dict(color='#00b4d8')))
-    fig_all.update_layout(title="Equity Cumulativa WFA — Storico Completo", xaxis_title="Data", yaxis_title="Net PnL ($)")
+    fig_all.add_trace(go.Scatter(
+        x=all_cum.index, y=all_cum.values, mode='lines', fill='tozeroy',
+        line=dict(color='#00d4ff', width=2),
+        fillcolor='rgba(0,212,255,0.08)'
+    ))
+    fig_all.update_layout(title="Equity Cumulativa WFA — Storico Completo",
+        xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
     st.plotly_chart(fig_all, use_container_width=True)
 
     # ─── 4. EQUITY RECENTE ───────────────────────────────────────────────────
@@ -518,8 +698,13 @@ if uploaded_file is not None:
         rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
         rec_cum = rec_daily.cumsum()
         fig_rec = go.Figure()
-        fig_rec.add_trace(go.Scatter(x=rec_cum.index, y=rec_cum.values, mode='lines', fill='tozeroy', line=dict(color='#f77f00')))
-        fig_rec.update_layout(title="Equity Cumulativa WFA — Dal 1° Settembre 2025", xaxis_title="Data", yaxis_title="Net PnL ($)")
+        fig_rec.add_trace(go.Scatter(
+            x=rec_cum.index, y=rec_cum.values, mode='lines', fill='tozeroy',
+            line=dict(color='#f59e0b', width=2),
+            fillcolor='rgba(245,158,11,0.08)'
+        ))
+        fig_rec.update_layout(title="Equity Cumulativa WFA — Dal 1° Settembre 2025",
+            xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
         st.plotly_chart(fig_rec, use_container_width=True)
     else:
         st.info("Nessun dato OOS disponibile dal 1° settembre 2025.")
