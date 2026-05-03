@@ -41,12 +41,8 @@ def calculate_metrics(df):
         calmar = ann_ret / max_dd
     return total_pnl, max_dd, sharpe, calmar
 
-# FIX: CUSUM calcolato SOLO sui dati IS passati come argomento (mai sull'intero dataset)
 def compute_cusum_banned(is_data_strat):
-    """
-    Riceve i soli trade IS (finestra rolling 12 mesi) di una singola strategia.
-    Restituisce la lista dei weekday (0=Lun..4=Ven) da blacklistare per il successivo OOS.
-    """
+    """Calcola giorni da blacklistare SOLO sui dati IS della finestra rolling 12 mesi."""
     banned = []
     for day in range(7):
         day_data = is_data_strat[is_data_strat['weekday_open'] == day].sort_values('Date Closed')
@@ -75,10 +71,8 @@ if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
         df.columns = df.columns.str.strip()
 
-        # 1. PREPROCESSING
         df_filtered = df[~df['Strategy'].astype(str).str.contains('Legendary', na=False, case=False)].copy()
 
-        # BLOCCO DI SICUREZZA: strategie non mappate
         unique_strategies = df_filtered['Strategy'].unique().tolist()
         unmapped = [s for s in unique_strategies if s not in strategy_mapping]
         if unmapped:
@@ -89,7 +83,6 @@ if uploaded_file is not None:
         df_filtered['Date Opened'] = pd.to_datetime(df_filtered['Date Opened'])
         df_filtered['Date Closed'] = pd.to_datetime(df_filtered['Date Closed'])
         df_filtered['weekday_open'] = df_filtered['Date Opened'].dt.weekday
-
         df_filtered['P/L'] = df_filtered['P/L'].apply(clean_money)
         df_filtered['P/L %'] = df_filtered['P/L %'].apply(
             lambda x: float(str(x).replace('%', '').replace(',', '')) if pd.notna(x) else np.nan
@@ -106,22 +99,19 @@ if uploaded_file is not None:
         min_date = df_filtered['Date Closed'].min()
         max_date = df_filtered['Date Closed'].max()
 
-        # 2. MOTORE WALK-FORWARD (IS 12 mesi, OOS 28 giorni)
         current_oos_start = min_date + pd.DateOffset(months=12)
         oos_results = []
         historical_allocations = []
+        cusum_exclusions_log = []
 
         while current_oos_start <= max_date:
             current_oos_end = current_oos_start + pd.Timedelta(days=28)
             current_is_start = current_oos_start - pd.DateOffset(months=12)
 
-            # IS: SOLO i trade nella finestra rolling 12 mesi
             is_data = df_filtered[
                 (df_filtered['Date Closed'] >= current_is_start) &
                 (df_filtered['Date Closed'] < current_oos_start)
             ].copy()
-
-            # OOS: 28 giorni successivi
             oos_data = df_filtered[
                 (df_filtered['Date Closed'] >= current_oos_start) &
                 (df_filtered['Date Closed'] < current_oos_end)
@@ -136,10 +126,8 @@ if uploaded_file is not None:
 
             is_metrics = []
             for strat in valid_strats:
-                # FIX: strat_is è sempre il subset IS della finestra corrente
                 strat_is = is_data[is_data['Strategy'] == strat].copy()
 
-                # Omega Ratio su IS
                 if strat_is['P/L %'].notna().sum() > 0:
                     pos_sum = strat_is[strat_is['P/L %'] > 0]['P/L %'].sum()
                     neg_sum = strat_is[strat_is['P/L %'] < 0]['P/L %'].sum()
@@ -150,8 +138,19 @@ if uploaded_file is not None:
                 omega = 50.0 if neg_sum == 0 else pos_sum / abs(neg_sum)
                 total_net_pnl = strat_is['Net PnL'].sum()
 
-                # FIX: CUSUM riceve SOLO strat_is (finestra IS), mai df_filtered intero
                 banned_days = compute_cusum_banned(strat_is)
+
+                # NUOVA REGOLA: se CUSUM banna TUTTI i giorni su cui la strategia opera realmente -> esclusa
+                active_days_in_is = strat_is['weekday_open'].unique().tolist()
+                remaining_days = [d for d in active_days_in_is if d not in banned_days]
+
+                if not remaining_days:
+                    cusum_exclusions_log.append({
+                        'OOS Start': current_oos_start,
+                        'Strategy': strat,
+                        'Motivo': f"CUSUM ha bannato tutti i giorni operativi: {format_banned_days(banned_days)}"
+                    })
+                    continue  # strategia esclusa dalla selezione
 
                 is_metrics.append({
                     'Strategy': strat,
@@ -189,12 +188,11 @@ if uploaded_file is not None:
                         'Family': strat_row['Family'],
                         'Omega IS': strat_row['Omega'],
                         'Weight': weight,
-                        'Banned Days': banned   # lista nativa, non stringa
+                        'Banned Days': banned
                     })
 
                     strat_oos = oos_data[oos_data['Strategy'] == strat_name].copy()
                     if not strat_oos.empty:
-                        # Applica blacklist CUSUM sull'OOS
                         strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned)]
                         strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
                         oos_results.append(strat_oos)
@@ -207,6 +205,7 @@ if uploaded_file is not None:
 
         final_oos_df = pd.concat(oos_results).sort_values(by='Date Closed').reset_index(drop=True)
         hist_alloc_df = pd.DataFrame(historical_allocations)
+        exclusions_df = pd.DataFrame(cusum_exclusions_log)
 
     st.success('Elaborazione completata con successo!')
 
@@ -219,11 +218,16 @@ if uploaded_file is not None:
     display_alloc = latest_alloc[['Rank', 'Strategy', 'Family', 'Omega IS', 'Weight', 'Banned Days']].copy()
     display_alloc['Weight'] = (display_alloc['Weight'] * 100).astype(int).astype(str) + '%'
     display_alloc['Omega IS'] = display_alloc['Omega IS'].round(4)
-    # FIX: Banned Days è già una lista nativa, non serve eval()
     display_alloc['Giorni Spenti (CUSUM)'] = display_alloc['Banned Days'].apply(format_banned_days)
     display_alloc.drop(columns=['Banned Days'], inplace=True)
-
     st.dataframe(display_alloc, use_container_width=True, hide_index=True)
+
+    # Mostra strategie escluse nell'ultima finestra (se presenti)
+    if not exclusions_df.empty:
+        latest_excl = exclusions_df[exclusions_df['OOS Start'] == latest_start]
+        if not latest_excl.empty:
+            st.warning(f"\u26a0\ufe0f Strategie escluse in questa finestra perch\u00e9 CUSUM ha bannato tutti i loro giorni operativi:")
+            st.dataframe(latest_excl[['Strategy', 'Motivo']], use_container_width=True, hide_index=True)
 
     # --- 2. METRICHE OOS ---
     st.header("2. Metriche Out-Of-Sample")
@@ -264,12 +268,10 @@ if uploaded_file is not None:
         )
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Nessun dato OOS disponibile dal 1° settembre 2025.")
+        st.info("Nessun dato OOS disponibile dal 1\u00b0 settembre 2025.")
 
     # --- 4. EXPORT ---
     st.header("4. Esporta Dati")
-
-    # Serializza Banned Days come stringa per il CSV
     hist_alloc_export = hist_alloc_df.copy()
     hist_alloc_export['Banned Days'] = hist_alloc_export['Banned Days'].apply(
         lambda x: format_banned_days(x) if isinstance(x, list) else x
