@@ -1,19 +1,14 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 1.0.0 — 2026-05-04
+#  Versione: 1.1.0 — 2026-05-04
 #
 #  Questo modulo fornisce:
 #  - run_wfa_single(...): motore Walk-Forward parametrico per una singola combinazione
 #  - render_optimizer_tab(...): UI Streamlit "⚙️ Ottimizzatore" per grid search dei parametri
 #
-#  Integrazione tipica (da fare in streamlit_wfa_app.py):
-#      from wfa_optimizer_module import run_wfa_single, render_optimizer_tab
-#      ...
-#      with tab_opt:
-#          render_optimizer_tab(df_processed=df_preprocessed, group_map=GROUP_MAP,
-#                               date_col="Date Closed", strategy_col="Strategy",
-#                               pnl_col="Net PnL")
+#  Usa le stesse metriche IS del main importandole da wfa_core.py
+#  per evitare duplicazione di logica.
 # ================================================================
 
 from __future__ import annotations
@@ -30,6 +25,13 @@ import plotly.graph_objects as go
 import streamlit as st
 from dateutil.relativedelta import relativedelta
 
+from wfa_core import (
+    RANKING_METRICS,
+    DEFAULT_RANKING_METRIC,
+    compute_ranking_score,
+    passes_roc_filter,
+)
+
 
 # ─────────────────────────────────────────────────────────────────
 # DATA CLASS PARAMETRI
@@ -42,7 +44,7 @@ class WFAParams:
     full_weight_pct: float
     bench_weight_pct: float
     max_per_group: int
-    ranking_metric: str  # "Sharpe", "Sortino", "Omega", "Ulcer", "ROC"
+    ranking_metric: str  # deve essere uno di RANKING_METRICS
     roc_filter_enabled: bool
     roc_filter_steps: int
     is_months: int = 12
@@ -52,53 +54,6 @@ class WFAParams:
 # ─────────────────────────────────────────────────────────────────
 # CORE: singolo loop WFA
 # ─────────────────────────────────────────────────────────────────
-
-def _compute_rank_score(returns: np.ndarray, metric: str, roc_steps: int) -> float:
-    """Calcola lo score IS per una serie di PnL giornalieri."""
-    if returns.size < 2:
-        return -999.0
-
-    mean_r = float(np.mean(returns))
-    std_r = float(np.std(returns))
-
-    if metric == "Sharpe":
-        return (mean_r / (std_r or 1e-9)) * math.sqrt(252)
-
-    if metric == "Sortino":
-        neg = returns[returns < 0]
-        dstd = float(np.std(neg)) if neg.size > 1 else 0.0
-        return (mean_r / (dstd or 1e-9)) * math.sqrt(252)
-
-    if metric == "Omega":
-        gains = float(np.sum(np.maximum(returns, 0)))
-        losses = float(np.sum(np.maximum(-returns, 0)))
-        return gains / (losses or 1e-9)
-
-    if metric == "Ulcer":
-        cum = np.cumsum(returns)
-        peak = np.maximum.accumulate(cum)
-        dd = cum - peak
-        ui = math.sqrt(float(np.mean(dd**2))) if dd.size > 0 else 0.0
-        return mean_r / (ui or 1e-9)
-
-    if metric == "ROC":
-        # Rate of Change sul PnL cumulativo nella finestra IS
-        cum = np.cumsum(returns)
-        return (cum[-1] - cum[0]) / (abs(cum[0]) + 1e-9)
-
-    # Default: Sharpe
-    return (mean_r / (std_r or 1e-9)) * math.sqrt(252)
-
-
-def _passes_roc_filter(returns: np.ndarray, steps: int) -> bool:
-    """True se il ROC recente su 'steps' periodi è >= 0."""
-    if steps <= 0 or returns.size <= steps:
-        return True
-    cum = np.cumsum(returns)
-    base = cum[-steps - 1]
-    recent_roc = (cum[-1] - base) / (abs(base) + 1e-9)
-    return recent_roc >= 0
-
 
 def _max_drawdown(arr: np.ndarray) -> float:
     if arr.size == 0:
@@ -158,24 +113,29 @@ def run_wfa_single(
             start_is = start_oos
             continue
 
-        # ── Ranking IS per strategia ────────────────────────────
+        # ── Ranking IS per strategia (riusa compute_ranking_score di wfa_core) ──
         metrics_rows = []
         for strat, grp in is_data.groupby(strategy_col):
-            pnl = grp[pnl_col].to_numpy(dtype=float)
-            if pnl.size < 5:
+            if len(grp) < 5:
                 continue
 
-            # ROC filter opzionale
-            if params.roc_filter_enabled and not _passes_roc_filter(pnl, params.roc_filter_steps):
+            # Standardizza nomi colonne per le funzioni del core
+            strat_is = grp.rename(columns={date_col: "Date Closed", pnl_col: "Net PnL"})
+
+            # ROC filter opzionale (stessa logica del main)
+            if params.roc_filter_enabled and not passes_roc_filter(strat_is, params.roc_filter_steps):
                 continue
 
-            score = _compute_rank_score(pnl, params.ranking_metric, params.roc_filter_steps)
+            score, higher_is_better = compute_ranking_score(
+                strat_is, params.ranking_metric, params.roc_filter_steps
+            )
             metrics_rows.append(
                 {
                     "strategy": strat,
                     "score": score,
                     "family": group_map.get(strat, "Unknown"),
-                    "total_pnl_is": float(pnl.sum()),
+                    "total_pnl_is": float(strat_is["Net PnL"].sum()),
+                    "higher_is_better": higher_is_better,
                 }
             )
 
@@ -184,7 +144,10 @@ def run_wfa_single(
             continue
 
         metrics_df = pd.DataFrame(metrics_rows)
-        metrics_df = metrics_df.sort_values(["score", "total_pnl_is"], ascending=[False, False])
+        if metrics_df["higher_is_better"].all():
+            metrics_df = metrics_df.sort_values(["score", "total_pnl_is"], ascending=[False, False])
+        else:
+            metrics_df = metrics_df.sort_values(["score", "total_pnl_is"], ascending=[True, False])
 
         # ── Selezione top_n con vincolo max_per_group ───────────
         selected: List[Dict[str, object]] = []
@@ -348,7 +311,6 @@ def render_optimizer_tab(
             oos_days = st.number_input("OOS giorni", 7, 90, 28)
 
     # ── Costruzione griglia di combinazioni ─────────────────────
-    ALL_RANKING = ["Sharpe", "Sortino", "Omega", "Ulcer", "ROC"]
 
     def _fixed_session(key: str, default):
         return [st.session_state.get(key, default)]
@@ -358,7 +320,7 @@ def render_optimizer_tab(
     fwp_range = fwp_values or [80] if use_fwp else _fixed_session("full_weight_pct", 80)
     bwp_range = bwp_values or [40] if use_bwp else _fixed_session("bench_weight_pct", 40)
     mpg_range = list(range(int(mpg_min), int(mpg_max) + 1)) if use_mpg else _fixed_session("max_per_group", 2)
-    rank_range = ALL_RANKING if use_rank else _fixed_session("ranking_metric", "Omega")
+    rank_range = RANKING_METRICS if use_rank else _fixed_session("ranking_metric", DEFAULT_RANKING_METRIC)
     roc_en_range = [True, False] if use_roc_en else _fixed_session("roc_filter_enabled", True)
     roc_steps_range = roc_steps_values or [2] if use_roc_steps else _fixed_session("roc_filter_steps", 2)
 
