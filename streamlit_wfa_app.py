@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import io
 import json
 
 st.set_page_config(page_title="Texano's Walk Forward", layout="wide")
@@ -351,10 +352,16 @@ for key, default in [
 # ─── UPLOAD CSV ──────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Carica il dataset dei trade (CSV)", type=['csv'])
 
+@st.cache_data(show_spinner=False)
+def preprocess_df(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    df.columns = df.columns.str.strip()
+    df = df[~df['Strategy'].astype(str).str.contains('Legendary', na=False, case=False)].copy()
+    return df
+
 if uploaded_file is not None:
-    df_raw = pd.read_csv(uploaded_file)
-    df_raw.columns = df_raw.columns.str.strip()
-    df_raw = df_raw[~df_raw['Strategy'].astype(str).str.contains('Legendary', na=False, case=False)].copy()
+    file_bytes = uploaded_file.getvalue()
+    df_raw = preprocess_df(file_bytes)
     all_strategies_in_file = sorted(df_raw['Strategy'].dropna().unique().tolist())
 
     if 'strategy_mapping' not in st.session_state:
