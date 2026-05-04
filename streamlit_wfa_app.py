@@ -1,4 +1,1 @@
-# content della patch applicata - vedi esecuzione
-import io
-import json
-import itertools
+/tmp/patched_app.py
