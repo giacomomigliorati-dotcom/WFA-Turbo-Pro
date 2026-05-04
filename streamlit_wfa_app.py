@@ -5,6 +5,8 @@ import plotly.graph_objects as go
 import io
 import json
 
+from wfa_optimizer_module import render_optimizer_tab
+
 st.set_page_config(page_title="Texano's Walk Forward", layout="wide")
 
 # ─── OZONE THEME CSS ─────────────────────────────────────────────────────────
@@ -143,7 +145,7 @@ DEFAULT_FULL_WEIGHT_COUNT  = 5
 DEFAULT_FULL_WEIGHT_PCT    = 100
 DEFAULT_BENCH_WEIGHT_PCT   = 50
 DEFAULT_RANKING_METRIC     = "Omega Ratio"
-DEFAULT_ROC_STEPS          = 2       # finestra ROC = 2 × 28 = 56 giorni
+DEFAULT_ROC_STEPS          = 2
 DEFAULT_ROC_FILTER_ENABLED = False
 DEFAULT_ROC_FILTER_STEPS   = 2
 
@@ -157,7 +159,7 @@ OZONE_LAYOUT = dict(
     margin=dict(l=50, r=30, t=60, b=50),
 )
 
-# ─── FUNZIONI METRICHE IS ──────────────────────────────────────────────────────────
+# ─── FUNZIONI METRICHE IS ─────────────────────────────────────────────────────
 def calc_omega(strat_is):
     if strat_is['P/L %'].notna().sum() > 0:
         pos = strat_is[strat_is['P/L %'] > 0]['P/L %'].sum()
@@ -180,42 +182,32 @@ def calc_sortino(strat_is):
     return (daily.mean() / down) * np.sqrt(252) if pd.notna(down) and down > 0 else -999.0
 
 def calc_ulcer(strat_is):
-    """Ulcer Index (minore = migliore; ranking verrà invertito)."""
     daily = strat_is.groupby(strat_is['Date Closed'].dt.date)['Net PnL'].sum()
     cum   = daily.cumsum()
     peak  = cum.cummax()
-    dd_pct = ((cum - peak) / (peak.abs() + 1e-9)) * 100  # % drawdown
+    dd_pct = ((cum - peak) / (peak.abs() + 1e-9)) * 100
     ui = np.sqrt((dd_pct ** 2).mean())
     return ui if ui > 0 else 0.0
 
 def calc_roc(strat_is, n_steps):
-    """ROC = variazione % del Net PnL cumulativo su finestra di n_steps * OOS_STEP_DAYS."""
     window_days = n_steps * OOS_STEP_DAYS
     cutoff = strat_is['Date Closed'].max() - pd.Timedelta(days=window_days)
     recent = strat_is[strat_is['Date Closed'] > cutoff]
     if recent.empty: return -999.0
-    pnl_window = recent['Net PnL'].sum()
-    return pnl_window  # in $ assoluti (già ordinabile)
+    return recent['Net PnL'].sum()
 
 def compute_ranking_score(strat_is, metric, roc_steps):
-    """Ritorna (score, higher_is_better)."""
-    if metric == "Omega Ratio":
-        return calc_omega(strat_is), True
-    elif metric == "Sharpe Ratio":
-        return calc_sharpe(strat_is), True
-    elif metric == "Sortino Ratio":
-        return calc_sortino(strat_is), True
-    elif metric == "Ulcer Index":
-        return calc_ulcer(strat_is), False  # minore = migliore
-    elif metric == "ROC":
-        return calc_roc(strat_is, roc_steps), True
+    if metric == "Omega Ratio":  return calc_omega(strat_is), True
+    elif metric == "Sharpe Ratio":  return calc_sharpe(strat_is), True
+    elif metric == "Sortino Ratio": return calc_sortino(strat_is), True
+    elif metric == "Ulcer Index":   return calc_ulcer(strat_is), False
+    elif metric == "ROC":           return calc_roc(strat_is, roc_steps), True
     return calc_omega(strat_is), True
 
 def passes_roc_filter(strat_is, filter_steps):
-    """True se ROC >= 0 (strategia non in perdita netta nella finestra filtro)."""
     return calc_roc(strat_is, filter_steps) >= 0
 
-# ─── FUNZIONI CORE GENERALI ────────────────────────────────────────────────────────
+# ─── FUNZIONI CORE GENERALI ───────────────────────────────────────────────────
 def clean_money(val):
     if pd.isna(val): return 0
     if isinstance(val, (int, float)): return val
@@ -293,7 +285,7 @@ def format_banned_days(banned_list):
     if not banned_list: return "Nessuno"
     return ", ".join([GIORNI_SETTIMANA[d] for d in banned_list if d < len(GIORNI_SETTIMANA)])
 
-# ─── FUNZIONI JSON CONFIG ────────────────────────────────────────────────────
+# ─── FUNZIONI JSON CONFIG ─────────────────────────────────────────────────────
 def build_config_payload():
     return {
         "version": 3,
@@ -335,7 +327,7 @@ def apply_config_payload(payload, all_strategies):
     st.session_state["roc_filter_enabled"]= bool(payload.get("roc_filter_enabled",       DEFAULT_ROC_FILTER_ENABLED))
     st.session_state["roc_filter_steps"]  = max(1, int(payload.get("roc_filter_steps",   DEFAULT_ROC_FILTER_STEPS)))
 
-# ─── INIT SESSION STATE ──────────────────────────────────────────────────────────────
+# ─── INIT SESSION STATE ───────────────────────────────────────────────────────
 for key, default in [
     ("top_n",             DEFAULT_TOP_N),
     ("full_weight_count", DEFAULT_FULL_WEIGHT_COUNT),
@@ -349,7 +341,7 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ─── UPLOAD CSV ──────────────────────────────────────────────────────────────
+# ─── UPLOAD CSV ───────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Carica il dataset dei trade (CSV)", type=['csv'])
 
 @st.cache_data(show_spinner=False)
@@ -374,10 +366,9 @@ if uploaded_file is not None:
         if strat not in st.session_state['strategy_mapping']:
             st.session_state['strategy_mapping'][strat] = ''
 
-    # ─── SIDEBAR ─────────────────────────────────────────────────────────────
+    # ─── SIDEBAR ──────────────────────────────────────────────────────────────
     st.sidebar.header("⚙️ Configurazione")
 
-    # ── BACKUP JSON
     st.sidebar.subheader("💾 Backup configurazione")
     st.sidebar.caption("Esporta per salvare tutti i parametri. Reimporta dopo ogni refresh.")
     config_json_str = json.dumps(build_config_payload(), ensure_ascii=False, indent=2)
@@ -405,9 +396,7 @@ if uploaded_file is not None:
 
     st.sidebar.divider()
 
-    # ── PARAMETRI WFA
     st.sidebar.subheader("🎛️ Parametri WFA")
-
     top_n = st.sidebar.number_input("Numero strategie selezionate (Top-N)",
         min_value=1, max_value=20, value=st.session_state["top_n"], step=1, help="Default: 7")
     st.session_state["top_n"] = int(top_n)
@@ -427,12 +416,9 @@ if uploaded_file is not None:
 
     bench_count = int(top_n) - int(full_weight_count)
     st.sidebar.markdown(f"**Schema:** {int(full_weight_count)}×{int(full_weight_pct)}% + {bench_count}×{int(bench_weight_pct)}%")
-
     st.sidebar.divider()
 
-    # ── METRICA DI RANKING IS
     st.sidebar.subheader("🏆 Metrica di Ranking IS")
-
     ranking_metric_idx = RANKING_METRICS.index(st.session_state["ranking_metric"]) \
         if st.session_state["ranking_metric"] in RANKING_METRICS else 0
     ranking_metric = st.sidebar.selectbox(
@@ -447,14 +433,12 @@ if uploaded_file is not None:
         roc_steps = st.sidebar.number_input(
             f"Finestra ROC (multipli di {OOS_STEP_DAYS}gg)",
             min_value=1, max_value=24, value=st.session_state["roc_steps"], step=1,
-            help=f"Es. 2 = finestra di {2*OOS_STEP_DAYS} giorni. Usa i dati IS dell'ultimo anno."
+            help=f"Es. 2 = finestra di {2*OOS_STEP_DAYS} giorni."
         )
         st.session_state["roc_steps"] = int(roc_steps)
         st.sidebar.caption(f"📅 Finestra ROC attiva: **{int(roc_steps) * OOS_STEP_DAYS} giorni**")
-
     st.sidebar.divider()
 
-    # ── FILTRO ROC < 0
     st.sidebar.subheader("🚫 Filtro ROC < 0")
     roc_filter_enabled = st.sidebar.toggle(
         "Attiva filtro ROC < 0",
@@ -467,27 +451,21 @@ if uploaded_file is not None:
     if roc_filter_enabled:
         roc_filter_steps = st.sidebar.number_input(
             f"Finestra filtro ROC (multipli di {OOS_STEP_DAYS}gg)",
-            min_value=1, max_value=24, value=st.session_state["roc_filter_steps"], step=1,
-            help=f"Es. 2 = ultimi {2*OOS_STEP_DAYS} giorni della finestra IS."
+            min_value=1, max_value=24, value=st.session_state["roc_filter_steps"], step=1
         )
         st.session_state["roc_filter_steps"] = int(roc_filter_steps)
         st.sidebar.caption(
-            f"📅 Finestra filtro ROC: **{int(roc_filter_steps) * OOS_STEP_DAYS} giorni** — "
-            f"le strategie con PnL netto negativo in questo periodo vengono escluse."
+            f"📅 Finestra filtro ROC: **{int(roc_filter_steps) * OOS_STEP_DAYS} giorni**"
         )
-
     st.sidebar.divider()
 
-    # ── LIMITE MAX PER GRUPPO
     st.sidebar.subheader("Limite per gruppo")
     max_per_group = st.sidebar.number_input("Max strategie stesso gruppo",
         min_value=1, max_value=int(top_n),
         value=min(st.session_state['max_per_group'], int(top_n)), step=1, help="Default 2")
     st.session_state['max_per_group'] = int(max_per_group)
-
     st.sidebar.divider()
 
-    # ── GESTIONE GRUPPI
     st.sidebar.subheader("Gestione gruppi")
     new_group_name = st.sidebar.text_input("Nome nuovo gruppo", key="new_group_name")
     if st.sidebar.button("➕ Crea gruppo"):
@@ -521,10 +499,8 @@ if uploaded_file is not None:
                     for s, g in st.session_state['strategy_mapping'].items()}
                 st.sidebar.success(f"'{old_name}' → '{new_name}'")
                 st.rerun()
-
     st.sidebar.divider()
 
-    # ── ASSEGNAZIONE STRATEGIE
     st.sidebar.subheader("Assegnazione strategie")
     group_options = [''] + st.session_state['group_names']
     with st.sidebar.expander("📋 Modifica gruppo di ogni strategia", expanded=True):
@@ -546,288 +522,277 @@ if uploaded_file is not None:
         st.info("Apri la sidebar (▶), assegna un gruppo a ogni strategia e salva.")
         st.stop()
 
-    # ─── PULSANTE LANCIA WFA ─────────────────────────────────────────────────
-    st.markdown("---")
-    col_launch, col_info = st.columns([3, 7])
-    with col_launch:
-        launch = st.button("▶ Lancia simulazione WFA", type="primary", use_container_width=True)
-    with col_info:
-        roc_filter_label = (
-            f" &nbsp;|&nbsp; 🚫 ROC filter: <b style='color:#ef4444'>"
-            f"{int(roc_filter_steps)*OOS_STEP_DAYS}gg</b>"
-        ) if roc_filter_enabled else ""
-        ranking_label_color = "#f59e0b" if ranking_metric != "Omega Ratio" else "#00d4ff"
-        st.markdown(
-            f"<div style='padding-top:10px; color:#7a9abf; font-size:0.88rem;'>"
-            f"Ranking: <b style='color:{ranking_label_color}'>{ranking_metric}</b>"
-            + (f" ({int(roc_steps)*OOS_STEP_DAYS}gg)" if ranking_metric=="ROC" else "")
-            + f" &nbsp;|&nbsp; Top-N: <b style='color:#00d4ff'>{int(top_n)}</b>"
-            f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{int(full_weight_count)}×{int(full_weight_pct)}%</b>"
-            f" + <b style='color:#f59e0b'>{bench_count}×{int(bench_weight_pct)}%</b>"
-            f" &nbsp;|&nbsp; Max/gr: <b style='color:#00d4ff'>{int(max_per_group)}</b>"
-            + roc_filter_label + "</div>",
-            unsafe_allow_html=True
-        )
+    # ─── TAB PRINCIPALI ───────────────────────────────────────────────────────
+    tab_wfa, tab_opt = st.tabs(["📊 Walk-Forward", "⚙️ Ottimizzatore"])
 
-    if launch:
-        # Snapshot parametri al momento del click
-        _top_n    = int(st.session_state["top_n"])
-        _fwc      = int(st.session_state["full_weight_count"])
-        _fwp      = st.session_state["full_weight_pct"] / 100.0
-        _bwp      = st.session_state["bench_weight_pct"] / 100.0
-        _mpg      = int(st.session_state["max_per_group"])
-        _sm       = dict(st.session_state["strategy_mapping"])
-        _metric   = st.session_state["ranking_metric"]
-        _roc_s    = int(st.session_state["roc_steps"])
-        _roc_fe   = bool(st.session_state["roc_filter_enabled"])
-        _roc_fs   = int(st.session_state["roc_filter_steps"])
-
-        with st.spinner("Elaborazione Walk-Forward in corso..."):
-            df_filtered = df_raw.copy()
-            df_filtered['Date Opened'] = pd.to_datetime(df_filtered['Date Opened'])
-            df_filtered['Date Closed'] = pd.to_datetime(df_filtered['Date Closed'])
-            df_filtered['weekday_open'] = df_filtered['Date Opened'].dt.weekday
-            df_filtered['P/L'] = df_filtered['P/L'].apply(clean_money)
-            df_filtered['P/L %'] = df_filtered['P/L %'].apply(
-                lambda x: float(str(x).replace('%','').replace(',','')) if pd.notna(x) else np.nan)
-            df_filtered['Opening Commissions + Fees'] = df_filtered['Opening Commissions + Fees'].fillna(0).apply(clean_money)
-            df_filtered['Closing Commissions + Fees'] = df_filtered['Closing Commissions + Fees'].fillna(0).apply(clean_money)
-            df_filtered['Net PnL'] = (
-                df_filtered['P/L']
-                - df_filtered['Opening Commissions + Fees']
-                - df_filtered['Closing Commissions + Fees']
+    with tab_wfa:
+        # ── Pulsante lancia WFA
+        st.markdown("---")
+        col_launch, col_info = st.columns([3, 7])
+        with col_launch:
+            launch = st.button("▶ Lancia simulazione WFA", type="primary", use_container_width=True)
+        with col_info:
+            roc_filter_label = (
+                f" &nbsp;|&nbsp; 🚫 ROC filter: <b style='color:#ef4444'>"
+                f"{int(roc_filter_steps)*OOS_STEP_DAYS}gg</b>"
+            ) if roc_filter_enabled else ""
+            ranking_label_color = "#f59e0b" if ranking_metric != "Omega Ratio" else "#00d4ff"
+            st.markdown(
+                f"<div style='padding-top:10px; color:#7a9abf; font-size:0.88rem;'>"
+                f"Ranking: <b style='color:{ranking_label_color}'>{ranking_metric}</b>"
+                + (f" ({int(roc_steps)*OOS_STEP_DAYS}gg)" if ranking_metric=="ROC" else "")
+                + f" &nbsp;|&nbsp; Top-N: <b style='color:#00d4ff'>{int(top_n)}</b>"
+                f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{int(full_weight_count)}×{int(full_weight_pct)}%</b>"
+                f" + <b style='color:#f59e0b'>{bench_count}×{int(bench_weight_pct)}%</b>"
+                f" &nbsp;|&nbsp; Max/gr: <b style='color:#00d4ff'>{int(max_per_group)}</b>"
+                + roc_filter_label + "</div>",
+                unsafe_allow_html=True
             )
-            df_filtered = df_filtered.sort_values('Date Closed').reset_index(drop=True)
-            min_date  = df_filtered['Date Closed'].min()
-            max_date  = df_filtered['Date Closed'].max()
-            current_oos_start = min_date + pd.DateOffset(months=12)
-            oos_results, historical_allocations, cusum_exclusions_log, roc_filter_log = [], [], [], []
 
-            while current_oos_start <= max_date:
-                current_oos_end  = current_oos_start + pd.Timedelta(days=OOS_STEP_DAYS)
-                current_is_start = current_oos_start - pd.DateOffset(months=12)
-                is_data  = df_filtered[(df_filtered['Date Closed'] >= current_is_start)
-                                      & (df_filtered['Date Closed'] < current_oos_start)].copy()
-                oos_data = df_filtered[(df_filtered['Date Closed'] >= current_oos_start)
-                                      & (df_filtered['Date Closed'] < current_oos_end)].copy()
-                if is_data.empty:
+        if launch:
+            _top_n    = int(st.session_state["top_n"])
+            _fwc      = int(st.session_state["full_weight_count"])
+            _fwp      = st.session_state["full_weight_pct"] / 100.0
+            _bwp      = st.session_state["bench_weight_pct"] / 100.0
+            _mpg      = int(st.session_state["max_per_group"])
+            _sm       = dict(st.session_state["strategy_mapping"])
+            _metric   = st.session_state["ranking_metric"]
+            _roc_s    = int(st.session_state["roc_steps"])
+            _roc_fe   = bool(st.session_state["roc_filter_enabled"])
+            _roc_fs   = int(st.session_state["roc_filter_steps"])
+
+            with st.spinner("Elaborazione Walk-Forward in corso..."):
+                df_filtered = df_raw.copy()
+                df_filtered['Date Opened'] = pd.to_datetime(df_filtered['Date Opened'])
+                df_filtered['Date Closed'] = pd.to_datetime(df_filtered['Date Closed'])
+                df_filtered['weekday_open'] = df_filtered['Date Opened'].dt.weekday
+                df_filtered['P/L'] = df_filtered['P/L'].apply(clean_money)
+                df_filtered['P/L %'] = df_filtered['P/L %'].apply(
+                    lambda x: float(str(x).replace('%','').replace(',','')) if pd.notna(x) else np.nan)
+                df_filtered['Opening Commissions + Fees'] = df_filtered['Opening Commissions + Fees'].fillna(0).apply(clean_money)
+                df_filtered['Closing Commissions + Fees'] = df_filtered['Closing Commissions + Fees'].fillna(0).apply(clean_money)
+                df_filtered['Net PnL'] = (
+                    df_filtered['P/L']
+                    - df_filtered['Opening Commissions + Fees']
+                    - df_filtered['Closing Commissions + Fees']
+                )
+                df_filtered = df_filtered.sort_values('Date Closed').reset_index(drop=True)
+                min_date  = df_filtered['Date Closed'].min()
+                max_date  = df_filtered['Date Closed'].max()
+                current_oos_start = min_date + pd.DateOffset(months=12)
+                oos_results, historical_allocations, cusum_exclusions_log, roc_filter_log = [], [], [], []
+
+                while current_oos_start <= max_date:
+                    current_oos_end  = current_oos_start + pd.Timedelta(days=OOS_STEP_DAYS)
+                    current_is_start = current_oos_start - pd.DateOffset(months=12)
+                    is_data  = df_filtered[(df_filtered['Date Closed'] >= current_is_start)
+                                          & (df_filtered['Date Closed'] < current_oos_start)].copy()
+                    oos_data = df_filtered[(df_filtered['Date Closed'] >= current_oos_start)
+                                          & (df_filtered['Date Closed'] < current_oos_end)].copy()
+                    if is_data.empty:
+                        current_oos_start = current_oos_end
+                        continue
+
+                    valid_strats = is_data['Strategy'].value_counts()
+                    valid_strats = valid_strats[valid_strats >= 5].index.tolist()
+                    is_metrics = []
+
+                    for strat in valid_strats:
+                        if strat not in _sm: continue
+                        strat_is = is_data[is_data['Strategy'] == strat].copy()
+                        if _roc_fe and not passes_roc_filter(strat_is, _roc_fs):
+                            roc_filter_log.append({'OOS Start': current_oos_start, 'Strategy': strat,
+                                'Motivo': f"ROC < 0 su {_roc_fs*OOS_STEP_DAYS}gg"})
+                            continue
+                        score, higher_is_better = compute_ranking_score(strat_is, _metric, _roc_s)
+                        banned_days = compute_cusum_banned(strat_is)
+                        active_days = strat_is['weekday_open'].unique().tolist()
+                        remaining   = [d for d in active_days if d not in banned_days]
+                        if not remaining:
+                            cusum_exclusions_log.append({'OOS Start': current_oos_start, 'Strategy': strat,
+                                'Motivo': f"Tutti i giorni bannati: {format_banned_days(banned_days)}"})
+                            continue
+                        is_metrics.append({'Strategy': strat, 'Group': _sm[strat],
+                            'Score': score, 'Higher_is_better': higher_is_better,
+                            'Net PnL IS': strat_is['Net PnL'].sum(), 'Banned Days': banned_days})
+
+                    is_metrics_df = pd.DataFrame(is_metrics)
+                    if not is_metrics_df.empty:
+                        asc = False if is_metrics_df['Higher_is_better'].all() else True
+                        is_metrics_df = is_metrics_df.sort_values(['Score','Net PnL IS'], ascending=[asc, False])
+                        selected_strategies, group_counts = [], {}
+                        for _, row in is_metrics_df.iterrows():
+                            if len(selected_strategies) >= _top_n: break
+                            grp = row['Group']
+                            if group_counts.get(grp, 0) < _mpg:
+                                selected_strategies.append(row)
+                                group_counts[grp] = group_counts.get(grp, 0) + 1
+                        for rank, strat_row in enumerate(selected_strategies):
+                            weight     = _fwp if rank < _fwc else _bwp
+                            strat_name = strat_row['Strategy']
+                            banned     = strat_row['Banned Days']
+                            historical_allocations.append({
+                                'OOS Start': current_oos_start, 'OOS End': current_oos_end,
+                                'Rank': rank + 1, 'Strategy': strat_name, 'Group': strat_row['Group'],
+                                'Score IS': round(strat_row['Score'], 4), 'Metric': _metric,
+                                'Weight': weight, 'Banned Days': banned,
+                                'Top-N': _top_n, 'Max Per Group': _mpg,
+                            })
+                            strat_oos = oos_data[oos_data['Strategy'] == strat_name].copy()
+                            if not strat_oos.empty:
+                                strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned)]
+                                strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
+                                oos_results.append(strat_oos)
                     current_oos_start = current_oos_end
-                    continue
 
-                valid_strats = is_data['Strategy'].value_counts()
-                valid_strats = valid_strats[valid_strats >= 5].index.tolist()
-                is_metrics = []
-
-                for strat in valid_strats:
-                    if strat not in _sm: continue
-                    strat_is = is_data[is_data['Strategy'] == strat].copy()
-
-                    # ─ Filtro ROC < 0 (opzionale)
-                    if _roc_fe and not passes_roc_filter(strat_is, _roc_fs):
-                        roc_filter_log.append({
-                            'OOS Start': current_oos_start, 'Strategy': strat,
-                            'Motivo': f"ROC < 0 su {_roc_fs*OOS_STEP_DAYS}gg"
-                        })
-                        continue
-
-                    # ─ Metrica di ranking
-                    score, higher_is_better = compute_ranking_score(strat_is, _metric, _roc_s)
-
-                    # ─ CUSUM weekday ban
-                    banned_days = compute_cusum_banned(strat_is)
-                    active_days = strat_is['weekday_open'].unique().tolist()
-                    remaining   = [d for d in active_days if d not in banned_days]
-                    if not remaining:
-                        cusum_exclusions_log.append({
-                            'OOS Start': current_oos_start, 'Strategy': strat,
-                            'Motivo': f"Tutti i giorni bannati: {format_banned_days(banned_days)}"
-                        })
-                        continue
-
-                    is_metrics.append({
-                        'Strategy': strat, 'Group': _sm[strat],
-                        'Score': score, 'Higher_is_better': higher_is_better,
-                        'Net PnL IS': strat_is['Net PnL'].sum(),
-                        'Banned Days': banned_days
-                    })
-
-                is_metrics_df = pd.DataFrame(is_metrics)
-                if not is_metrics_df.empty:
-                    # Ulcer Index: ordinamento inverso
-                    asc = False if is_metrics_df['Higher_is_better'].all() else True
-                    is_metrics_df = is_metrics_df.sort_values(
-                        ['Score', 'Net PnL IS'], ascending=[asc, False]
-                    )
-                    selected_strategies, group_counts = [], {}
-                    for _, row in is_metrics_df.iterrows():
-                        if len(selected_strategies) >= _top_n: break
-                        grp = row['Group']
-                        if group_counts.get(grp, 0) < _mpg:
-                            selected_strategies.append(row)
-                            group_counts[grp] = group_counts.get(grp, 0) + 1
-
-                    for rank, strat_row in enumerate(selected_strategies):
-                        weight     = _fwp if rank < _fwc else _bwp
-                        strat_name = strat_row['Strategy']
-                        banned     = strat_row['Banned Days']
-                        historical_allocations.append({
-                            'OOS Start':   current_oos_start,
-                            'OOS End':     current_oos_end,
-                            'Rank':        rank + 1,
-                            'Strategy':    strat_name,
-                            'Group':       strat_row['Group'],
-                            'Score IS':    round(strat_row['Score'], 4),
-                            'Metric':      _metric,
-                            'Weight':      weight,
-                            'Banned Days': banned,
-                            'Top-N':       _top_n,
-                            'Max Per Group': _mpg,
-                        })
-                        strat_oos = oos_data[oos_data['Strategy'] == strat_name].copy()
-                        if not strat_oos.empty:
-                            strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned)]
-                            strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
-                            oos_results.append(strat_oos)
-
-                current_oos_start = current_oos_end
-
-        if not oos_results:
-            st.error("Nessun trade OOS generato. Il dataset deve coprire almeno 13 mesi di storia.")
-        else:
-            st.session_state["wfa_results"] = {
-                "final_oos_df":   pd.concat(oos_results).sort_values('Date Closed').reset_index(drop=True),
-                "hist_alloc_df":  pd.DataFrame(historical_allocations),
-                "exclusions_df":  pd.DataFrame(cusum_exclusions_log),
-                "roc_filter_df":  pd.DataFrame(roc_filter_log),
-                "params": {
-                    "top_n": _top_n, "full_weight_count": _fwc,
-                    "full_weight_pct": int(_fwp*100), "bench_weight_pct": int(_bwp*100),
-                    "max_per_group": _mpg, "ranking_metric": _metric,
-                    "roc_steps": _roc_s, "roc_filter_enabled": _roc_fe, "roc_filter_steps": _roc_fs,
+            if not oos_results:
+                st.error("Nessun trade OOS generato. Il dataset deve coprire almeno 13 mesi di storia.")
+            else:
+                st.session_state["wfa_results"] = {
+                    "final_oos_df":   pd.concat(oos_results).sort_values('Date Closed').reset_index(drop=True),
+                    "hist_alloc_df":  pd.DataFrame(historical_allocations),
+                    "exclusions_df":  pd.DataFrame(cusum_exclusions_log),
+                    "roc_filter_df":  pd.DataFrame(roc_filter_log),
+                    "params": {
+                        "top_n": _top_n, "full_weight_count": _fwc,
+                        "full_weight_pct": int(_fwp*100), "bench_weight_pct": int(_bwp*100),
+                        "max_per_group": _mpg, "ranking_metric": _metric,
+                        "roc_steps": _roc_s, "roc_filter_enabled": _roc_fe, "roc_filter_steps": _roc_fs,
+                    }
                 }
-            }
-            st.success("✅ Elaborazione completata!")
+                st.success("✅ Elaborazione completata!")
 
-    # ─── RISULTATI ──────────────────────────────────────────────────────────────
-    if st.session_state.get("wfa_results") is not None:
-        res           = st.session_state["wfa_results"]
-        final_oos_df  = res["final_oos_df"]
-        hist_alloc_df = res["hist_alloc_df"]
-        exclusions_df = res["exclusions_df"]
-        roc_filter_df = res.get("roc_filter_df", pd.DataFrame())
-        run_params    = res["params"]
+        # ── Risultati WFA
+        if st.session_state.get("wfa_results") is not None:
+            res           = st.session_state["wfa_results"]
+            final_oos_df  = res["final_oos_df"]
+            hist_alloc_df = res["hist_alloc_df"]
+            exclusions_df = res["exclusions_df"]
+            roc_filter_df = res.get("roc_filter_df", pd.DataFrame())
+            run_params    = res["params"]
 
-        # ── 1. ALLOCAZIONE CORRENTE
-        st.header("1. Allocazione Corrente")
-        latest_start = hist_alloc_df['OOS Start'].max()
-        latest_end   = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start]['OOS End'].iloc[0]
-        today        = pd.Timestamp.today().normalize()
-        days_left    = (latest_end - today).days
+            st.header("1. Allocazione Corrente")
+            latest_start = hist_alloc_df['OOS Start'].max()
+            latest_end   = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start]['OOS End'].iloc[0]
+            today        = pd.Timestamp.today().normalize()
+            days_left    = (latest_end - today).days
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.info(f"📅 **Dal:** {latest_start.strftime('%d %b %Y')}")
-        c2.info(f"🔚 **Fino al:** {latest_end.strftime('%d %b %Y')}")
-        if days_left > 0:
-            c3.warning(f"⏳ **Rotazione tra:** {days_left}gg")
-        else:
-            c3.error("🔄 **Rotazione scaduta**")
-        c4.info(f"🏆 **Ranking:** {run_params['ranking_metric']}")
-        c5.info(f"🎛️ Top-N: **{run_params['top_n']}** | Max/gr: **{run_params['max_per_group']}**")
-        c6.info(
-            f"⚖️ **{run_params['full_weight_count']}×{run_params['full_weight_pct']}%** "
-            f"+ **{run_params['top_n']-run_params['full_weight_count']}×{run_params['bench_weight_pct']}%**"
-        )
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.info(f"📅 **Dal:** {latest_start.strftime('%d %b %Y')}")
+            c2.info(f"🔚 **Fino al:** {latest_end.strftime('%d %b %Y')}")
+            if days_left > 0: c3.warning(f"⏳ **Rotazione tra:** {days_left}gg")
+            else:             c3.error("🔄 **Rotazione scaduta**")
+            c4.info(f"🏆 **Ranking:** {run_params['ranking_metric']}")
+            c5.info(f"🎛️ Top-N: **{run_params['top_n']}** | Max/gr: **{run_params['max_per_group']}**")
+            c6.info(f"⚖️ **{run_params['full_weight_count']}×{run_params['full_weight_pct']}%** + **{run_params['top_n']-run_params['full_weight_count']}×{run_params['bench_weight_pct']}%**")
 
-        latest_alloc = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start].copy()
-        disp = latest_alloc[['Rank','Strategy','Group','Score IS','Metric','Weight','Banned Days']].copy()
-        disp.rename(columns={'Score IS': f"Score IS ({run_params['ranking_metric']})", 'Metric': 'Metrica'}, inplace=True)
-        disp['Weight'] = (disp['Weight'] * 100).round(0).astype(int).astype(str) + '%'
-        disp['Giorni Spenti (CUSUM)'] = disp['Banned Days'].apply(format_banned_days)
-        disp.drop(columns=['Banned Days', 'Metrica'], inplace=True)
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+            latest_alloc = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start].copy()
+            disp = latest_alloc[['Rank','Strategy','Group','Score IS','Metric','Weight','Banned Days']].copy()
+            disp.rename(columns={'Score IS': f"Score IS ({run_params['ranking_metric']})", 'Metric': 'Metrica'}, inplace=True)
+            disp['Weight'] = (disp['Weight'] * 100).round(0).astype(int).astype(str) + '%'
+            disp['Giorni Spenti (CUSUM)'] = disp['Banned Days'].apply(format_banned_days)
+            disp.drop(columns=['Banned Days', 'Metrica'], inplace=True)
+            st.dataframe(disp, use_container_width=True, hide_index=True)
 
-        # Log esclusioni
-        _show_logs = []
-        if not exclusions_df.empty:
-            latest_excl = exclusions_df[exclusions_df['OOS Start'] == latest_start]
-            if not latest_excl.empty: _show_logs.append(("CUSUM", latest_excl))
-        if not roc_filter_df.empty:
-            latest_roc_excl = roc_filter_df[roc_filter_df['OOS Start'] == latest_start]
-            if not latest_roc_excl.empty: _show_logs.append(("ROC filter", latest_roc_excl))
-        for log_label, log_df in _show_logs:
-            st.warning(f"⚠️ Strategie escluse ({log_label}):")
-            st.dataframe(log_df[['Strategy','Motivo']], use_container_width=True, hide_index=True)
+            _show_logs = []
+            if not exclusions_df.empty:
+                latest_excl = exclusions_df[exclusions_df['OOS Start'] == latest_start]
+                if not latest_excl.empty: _show_logs.append(("CUSUM", latest_excl))
+            if not roc_filter_df.empty:
+                latest_roc_excl = roc_filter_df[roc_filter_df['OOS Start'] == latest_start]
+                if not latest_roc_excl.empty: _show_logs.append(("ROC filter", latest_roc_excl))
+            for log_label, log_df in _show_logs:
+                st.warning(f"⚠️ Strategie escluse ({log_label}):")
+                st.dataframe(log_df[['Strategy','Motivo']], use_container_width=True, hide_index=True)
 
-        # ── 2. METRICHE OOS
-        st.header("2. Metriche Out-Of-Sample")
-        tab_global, tab_recent = st.tabs(["📊 Storico Completo OOS", "📈 Dal 1° Settembre 2025"])
-        with tab_global:
-            render_metrics(calculate_metrics(final_oos_df), "Metriche — Storico Completo OOS")
-        with tab_recent:
-            recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
-            render_metrics(calculate_metrics(recent_df), "Metriche — Dal 1° Settembre 2025")
+            st.header("2. Metriche Out-Of-Sample")
+            tab_global, tab_recent = st.tabs(["📊 Storico Completo OOS", "📈 Dal 1° Settembre 2025"])
+            with tab_global:
+                render_metrics(calculate_metrics(final_oos_df), "Metriche — Storico Completo OOS")
+            with tab_recent:
+                recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
+                render_metrics(calculate_metrics(recent_df), "Metriche — Dal 1° Settembre 2025")
 
-        # ── 3. EQUITY COMPLETA
-        st.header("3. Curva Equity — Storico Completo OOS")
-        all_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
-        all_cum   = all_daily.cumsum()
-        fig_all = go.Figure()
-        fig_all.add_trace(go.Scatter(
-            x=all_cum.index, y=all_cum.values, mode='lines', fill='tozeroy',
-            line=dict(color='#00d4ff', width=2), fillcolor='rgba(0,212,255,0.08)'
-        ))
-        fig_all.update_layout(title="Equity Cumulativa WFA — Storico Completo",
-            xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
-        st.plotly_chart(fig_all, use_container_width=True)
-
-        # ── 4. EQUITY RECENTE
-        st.header("4. Curva Equity — Dal 1° Settembre 2025")
-        recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
-        if not recent_df.empty:
-            rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
-            rec_cum   = rec_daily.cumsum()
-            fig_rec = go.Figure()
-            fig_rec.add_trace(go.Scatter(
-                x=rec_cum.index, y=rec_cum.values, mode='lines', fill='tozeroy',
-                line=dict(color='#f59e0b', width=2), fillcolor='rgba(245,158,11,0.08)'
+            st.header("3. Curva Equity — Storico Completo OOS")
+            all_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+            all_cum   = all_daily.cumsum()
+            fig_all = go.Figure()
+            fig_all.add_trace(go.Scatter(
+                x=all_cum.index, y=all_cum.values, mode='lines', fill='tozeroy',
+                line=dict(color='#00d4ff', width=2), fillcolor='rgba(0,212,255,0.08)'
             ))
-            fig_rec.update_layout(title="Equity Cumulativa WFA — Dal 1° Settembre 2025",
+            fig_all.update_layout(title="Equity Cumulativa WFA — Storico Completo",
                 xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
-            st.plotly_chart(fig_rec, use_container_width=True)
-        else:
-            st.info("Nessun dato OOS disponibile dal 1° settembre 2025.")
+            st.plotly_chart(fig_all, use_container_width=True)
 
-        # ── 5. EXPORT
-        st.header("5. Esporta Dati")
-        hist_export = hist_alloc_df.copy()
-        hist_export['Banned Days'] = hist_export['Banned Days'].apply(
-            lambda x: format_banned_days(x) if isinstance(x, list) else x)
-        equity_csv_df = pd.DataFrame({
-            'Date': all_cum.index, 'Daily PnL': all_daily.values, 'Cumulative PnL': all_cum.values})
-
-        col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
-        with col_b1:
-            st.download_button("📥 Allocazioni Storiche",
-                data=hist_export.to_csv(index=False).encode('utf-8'), file_name="wfa_allocations.csv", mime="text/csv")
-        with col_b2:
-            st.download_button("📥 Trade OOS Filtrati",
-                data=final_oos_df.to_csv(index=False).encode('utf-8'), file_name="wfa_oos_trades.csv", mime="text/csv")
-        with col_b3:
-            st.download_button("📥 Equity Line Completa",
-                data=equity_csv_df.to_csv(index=False).encode('utf-8'), file_name="equity_full.csv", mime="text/csv")
-        with col_b4:
+            st.header("4. Curva Equity — Dal 1° Settembre 2025")
+            recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
             if not recent_df.empty:
-                rec_equity_csv = pd.DataFrame({
-                    'Date': rec_cum.index, 'Daily PnL': rec_daily.values, 'Cumulative PnL': rec_cum.values})
-                st.download_button("📥 Equity Line Set 2025+",
-                    data=rec_equity_csv.to_csv(index=False).encode('utf-8'), file_name="equity_sep2025.csv", mime="text/csv")
-        with col_b5:
-            combined_excl = pd.concat([exclusions_df, roc_filter_df]).reset_index(drop=True) \
-                if not roc_filter_df.empty else exclusions_df
-            if not combined_excl.empty:
-                combined_excl['OOS Start'] = combined_excl['OOS Start'].astype(str)
-                st.download_button("📥 Log Esclusioni",
-                    data=combined_excl.to_csv(index=False).encode('utf-8'), file_name="wfa_exclusions.csv", mime="text/csv")
+                rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+                rec_cum   = rec_daily.cumsum()
+                fig_rec = go.Figure()
+                fig_rec.add_trace(go.Scatter(
+                    x=rec_cum.index, y=rec_cum.values, mode='lines', fill='tozeroy',
+                    line=dict(color='#f59e0b', width=2), fillcolor='rgba(245,158,11,0.08)'
+                ))
+                fig_rec.update_layout(title="Equity Cumulativa WFA — Dal 1° Settembre 2025",
+                    xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
+                st.plotly_chart(fig_rec, use_container_width=True)
+            else:
+                st.info("Nessun dato OOS disponibile dal 1° settembre 2025.")
+
+            st.header("5. Esporta Dati")
+            hist_export = hist_alloc_df.copy()
+            hist_export['Banned Days'] = hist_export['Banned Days'].apply(
+                lambda x: format_banned_days(x) if isinstance(x, list) else x)
+            equity_csv_df = pd.DataFrame({
+                'Date': all_cum.index, 'Daily PnL': all_daily.values, 'Cumulative PnL': all_cum.values})
+
+            col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
+            with col_b1:
+                st.download_button("📥 Allocazioni Storiche",
+                    data=hist_export.to_csv(index=False).encode('utf-8'), file_name="wfa_allocations.csv", mime="text/csv")
+            with col_b2:
+                st.download_button("📥 Trade OOS Filtrati",
+                    data=final_oos_df.to_csv(index=False).encode('utf-8'), file_name="wfa_oos_trades.csv", mime="text/csv")
+            with col_b3:
+                st.download_button("📥 Equity Line Completa",
+                    data=equity_csv_df.to_csv(index=False).encode('utf-8'), file_name="equity_full.csv", mime="text/csv")
+            with col_b4:
+                if not recent_df.empty:
+                    rec_equity_csv = pd.DataFrame({
+                        'Date': rec_cum.index, 'Daily PnL': rec_daily.values, 'Cumulative PnL': rec_cum.values})
+                    st.download_button("📥 Equity Line Set 2025+",
+                        data=rec_equity_csv.to_csv(index=False).encode('utf-8'), file_name="equity_sep2025.csv", mime="text/csv")
+            with col_b5:
+                combined_excl = pd.concat([exclusions_df, roc_filter_df]).reset_index(drop=True) \
+                    if not roc_filter_df.empty else exclusions_df
+                if not combined_excl.empty:
+                    combined_excl['OOS Start'] = combined_excl['OOS Start'].astype(str)
+                    st.download_button("📥 Log Esclusioni",
+                        data=combined_excl.to_csv(index=False).encode('utf-8'), file_name="wfa_exclusions.csv", mime="text/csv")
+
+    # ─── TAB OTTIMIZZATORE ────────────────────────────────────────────────────
+    with tab_opt:
+        # Prepara df preprocessato con colonne standardizzate per l'ottimizzatore
+        df_opt = df_raw.copy()
+        df_opt['Date Closed'] = pd.to_datetime(df_opt['Date Closed'])
+        df_opt['Date Opened'] = pd.to_datetime(df_opt['Date Opened'])
+        df_opt['P/L'] = df_opt['P/L'].apply(clean_money)
+        df_opt['Opening Commissions + Fees'] = df_opt['Opening Commissions + Fees'].fillna(0).apply(clean_money)
+        df_opt['Closing Commissions + Fees'] = df_opt['Closing Commissions + Fees'].fillna(0).apply(clean_money)
+        df_opt['Net PnL'] = (
+            df_opt['P/L']
+            - df_opt['Opening Commissions + Fees']
+            - df_opt['Closing Commissions + Fees']
+        )
+        render_optimizer_tab(
+            df_processed=df_opt,
+            group_map=st.session_state['strategy_mapping'],
+            date_col='Date Closed',
+            strategy_col='Strategy',
+            pnl_col='Net PnL',
+        )
 
 else:
     st.info("⬆️ Carica un file CSV per iniziare.")
