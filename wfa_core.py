@@ -19,11 +19,11 @@ DEFAULT_ROC_FILTER_ENABLED = False
 DEFAULT_ROC_FILTER_STEPS  = 2
 
 
-# ─── FUNZIONI METRICHE IS ──────────────────────────────────────────────────────────
+# ─── FUNZIONI METRICHE IS ─────────────────────────────────────────────────────
 
 def calc_omega(strat_is: pd.DataFrame) -> float:
-    """Omega Ratio basato su P/L % se disponibile, altrimenti Net PnL assoluto."""
-    if strat_is['P/L %'].notna().sum() > 0:
+    """Omega Ratio: usa P/L % se disponibile, altrimenti Net PnL assoluto."""
+    if 'P/L %' in strat_is.columns and strat_is['P/L %'].notna().sum() > 0:
         pos = strat_is[strat_is['P/L %'] > 0]['P/L %'].sum()
         neg = strat_is[strat_is['P/L %'] < 0]['P/L %'].sum()
     else:
@@ -55,20 +55,19 @@ def calc_ulcer(strat_is: pd.DataFrame) -> float:
     daily = strat_is.groupby(strat_is['Date Closed'].dt.date)['Net PnL'].sum()
     cum = daily.cumsum()
     peak = cum.cummax()
-    dd_pct = ((cum - peak) / (peak.abs() + 1e-9)) * 100  # % drawdown
+    dd_pct = ((cum - peak) / (peak.abs() + 1e-9)) * 100
     ui = np.sqrt((dd_pct ** 2).mean())
     return ui if ui > 0 else 0.0
 
 
 def calc_roc(strat_is: pd.DataFrame, n_steps: int) -> float:
-    """ROC = variazione % del Net PnL cumulativo su finestra di n_steps * OOS_STEP_DAYS."""
+    """ROC = Net PnL cumulativo su finestra di n_steps * OOS_STEP_DAYS."""
     window_days = n_steps * OOS_STEP_DAYS
     cutoff = strat_is['Date Closed'].max() - pd.Timedelta(days=window_days)
     recent = strat_is[strat_is['Date Closed'] > cutoff]
     if recent.empty:
         return -999.0
-    pnl_window = recent['Net PnL'].sum()
-    return pnl_window  # in $ assoluti (già ordinabile)
+    return recent['Net PnL'].sum()
 
 
 def compute_ranking_score(strat_is: pd.DataFrame, metric: str, roc_steps: int):
@@ -80,10 +79,9 @@ def compute_ranking_score(strat_is: pd.DataFrame, metric: str, roc_steps: int):
     elif metric == "Sortino Ratio":
         return calc_sortino(strat_is), True
     elif metric == "Ulcer Index":
-        return calc_ulcer(strat_is), False  # minore = migliore
+        return calc_ulcer(strat_is), False
     elif metric == "ROC":
         return calc_roc(strat_is, roc_steps), True
-    # fallback
     return calc_omega(strat_is), True
 
 
@@ -111,7 +109,7 @@ def compute_cusum_banned(is_data_strat: pd.DataFrame):
 
 
 def format_banned_days(banned_list):
-    """Restituisce i weekday bannati in forma leggibile ("Lun, Mar, ...")."""
+    """Restituisce i weekday bannati in forma leggibile."""
     if not banned_list:
         return "Nessuno"
     return ", ".join([GIORNI_SETTIMANA[d] for d in banned_list if d < len(GIORNI_SETTIMANA)])
