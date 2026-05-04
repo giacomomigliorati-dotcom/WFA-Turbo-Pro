@@ -5,8 +5,18 @@ import pandas as pd
 GIORNI_SETTIMANA = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom']
 OOS_STEP_DAYS    = 28
 
-DEFAULT_RANKING_METRIC = "Omega Ratio"
-RANKING_METRICS = ["Omega Ratio", "Sharpe Ratio", "Sortino Ratio", "Ulcer Index", "ROC"]
+DEFAULT_RANKING_METRIC    = "Omega Ratio"
+RANKING_METRICS           = ["Omega Ratio", "Sharpe Ratio", "Sortino Ratio", "Ulcer Index", "ROC"]
+
+# Defaults parametri WFA
+DEFAULT_TOP_N             = 7
+DEFAULT_FULL_WEIGHT_COUNT = 3
+DEFAULT_FULL_WEIGHT_PCT   = 80
+DEFAULT_BENCH_WEIGHT_PCT  = 40
+DEFAULT_MAX_PER_GROUP     = 2
+DEFAULT_ROC_STEPS         = 2
+DEFAULT_ROC_FILTER_ENABLED = False
+DEFAULT_ROC_FILTER_STEPS  = 2
 
 
 # ─── FUNZIONI METRICHE IS ──────────────────────────────────────────────────────────
