@@ -5,6 +5,24 @@ import plotly.graph_objects as go
 import io
 import json
 
+from wfa_core import (
+    GIORNI_SETTIMANA,
+    OOS_STEP_DAYS,
+    DEFAULT_RANKING_METRIC,
+    RANKING_METRICS,
+    DEFAULT_MAX_PER_GROUP,
+    DEFAULT_TOP_N,
+    DEFAULT_FULL_WEIGHT_COUNT,
+    DEFAULT_FULL_WEIGHT_PCT,
+    DEFAULT_BENCH_WEIGHT_PCT,
+    DEFAULT_ROC_STEPS,
+    DEFAULT_ROC_FILTER_ENABLED,
+    DEFAULT_ROC_FILTER_STEPS,
+    compute_ranking_score,
+    passes_roc_filter,
+    compute_cusum_banned,
+    format_banned_days,
+)
 from wfa_optimizer_module import render_optimizer_tab
 
 st.set_page_config(page_title="Texano's Walk Forward", layout="wide")
@@ -116,7 +134,7 @@ configurabile (multipli di OOS step) è negativo. Utile per bloccare strategie i
 2. Al prossimo accesso: **📥 Importa** → **✅ Applica**
         """)
 
-# ─── COSTANTI ────────────────────────────────────────────────────────────────
+# ─── COSTANTI LOCALI (solo quelle non in wfa_core) ───────────────────────────
 DEFAULT_GROUP_MAPPING = {
     'Condor ZM+': 'Iron Condor',
     'TEST - Iron Condor delle 20:00': 'Iron Condor',
@@ -137,19 +155,6 @@ DEFAULT_GROUP_MAPPING = {
     'PDown w/VIX': 'Bearish (PDown)',
     'TEST - PDown': 'Bearish (PDown)'
 }
-GIORNI_SETTIMANA = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom']
-OOS_STEP_DAYS    = 28
-DEFAULT_MAX_PER_GROUP      = 2
-DEFAULT_TOP_N              = 7
-DEFAULT_FULL_WEIGHT_COUNT  = 5
-DEFAULT_FULL_WEIGHT_PCT    = 100
-DEFAULT_BENCH_WEIGHT_PCT   = 50
-DEFAULT_RANKING_METRIC     = "Omega Ratio"
-DEFAULT_ROC_STEPS          = 2
-DEFAULT_ROC_FILTER_ENABLED = False
-DEFAULT_ROC_FILTER_STEPS   = 2
-
-RANKING_METRICS = ["Omega Ratio", "Sharpe Ratio", "Sortino Ratio", "Ulcer Index", "ROC"]
 
 OZONE_LAYOUT = dict(
     plot_bgcolor='#0d1117', paper_bgcolor='#0d1117',
@@ -158,54 +163,6 @@ OZONE_LAYOUT = dict(
     yaxis=dict(gridcolor='#2a3f5f', linecolor='#2a3f5f', zerolinecolor='#2a3f5f'),
     margin=dict(l=50, r=30, t=60, b=50),
 )
-
-# ─── FUNZIONI METRICHE IS ─────────────────────────────────────────────────────
-def calc_omega(strat_is):
-    if strat_is['P/L %'].notna().sum() > 0:
-        pos = strat_is[strat_is['P/L %'] > 0]['P/L %'].sum()
-        neg = strat_is[strat_is['P/L %'] < 0]['P/L %'].sum()
-    else:
-        pos = strat_is[strat_is['Net PnL'] > 0]['Net PnL'].sum()
-        neg = strat_is[strat_is['Net PnL'] < 0]['Net PnL'].sum()
-    return 50.0 if neg == 0 else pos / abs(neg)
-
-def calc_sharpe(strat_is):
-    daily = strat_is.groupby(strat_is['Date Closed'].dt.date)['Net PnL'].sum()
-    if len(daily) < 2: return -999.0
-    m, s = daily.mean(), daily.std()
-    return (m / s) * np.sqrt(252) if s > 0 else -999.0
-
-def calc_sortino(strat_is):
-    daily = strat_is.groupby(strat_is['Date Closed'].dt.date)['Net PnL'].sum()
-    if len(daily) < 2: return -999.0
-    down = daily[daily < 0].std()
-    return (daily.mean() / down) * np.sqrt(252) if pd.notna(down) and down > 0 else -999.0
-
-def calc_ulcer(strat_is):
-    daily = strat_is.groupby(strat_is['Date Closed'].dt.date)['Net PnL'].sum()
-    cum   = daily.cumsum()
-    peak  = cum.cummax()
-    dd_pct = ((cum - peak) / (peak.abs() + 1e-9)) * 100
-    ui = np.sqrt((dd_pct ** 2).mean())
-    return ui if ui > 0 else 0.0
-
-def calc_roc(strat_is, n_steps):
-    window_days = n_steps * OOS_STEP_DAYS
-    cutoff = strat_is['Date Closed'].max() - pd.Timedelta(days=window_days)
-    recent = strat_is[strat_is['Date Closed'] > cutoff]
-    if recent.empty: return -999.0
-    return recent['Net PnL'].sum()
-
-def compute_ranking_score(strat_is, metric, roc_steps):
-    if metric == "Omega Ratio":  return calc_omega(strat_is), True
-    elif metric == "Sharpe Ratio":  return calc_sharpe(strat_is), True
-    elif metric == "Sortino Ratio": return calc_sortino(strat_is), True
-    elif metric == "Ulcer Index":   return calc_ulcer(strat_is), False
-    elif metric == "ROC":           return calc_roc(strat_is, roc_steps), True
-    return calc_omega(strat_is), True
-
-def passes_roc_filter(strat_is, filter_steps):
-    return calc_roc(strat_is, filter_steps) >= 0
 
 # ─── FUNZIONI CORE GENERALI ───────────────────────────────────────────────────
 def clean_money(val):
@@ -266,24 +223,6 @@ def render_metrics(m, label):
     r4[0].metric("Avg Daily PnL", f"${m['Avg Daily PnL ($)']:,.2f}")
     r4[1].metric("Best Day",      f"${m['Best Day ($)']:,.2f}")
     r4[2].metric("Worst Day",     f"${m['Worst Day ($)']:,.2f}")
-
-def compute_cusum_banned(is_data_strat):
-    banned = []
-    for day in range(7):
-        day_data = is_data_strat[is_data_strat['weekday_open'] == day].sort_values('Date Closed')
-        if len(day_data) >= 10:
-            std = day_data['Net PnL'].std()
-            if std > 0:
-                k, h, c_low = 0.5 * std, 3.0 * std, 0
-                for pnl in day_data['Net PnL']:
-                    c_low = max(0, c_low - pnl - k)
-                if c_low > h:
-                    banned.append(day)
-    return banned
-
-def format_banned_days(banned_list):
-    if not banned_list: return "Nessuno"
-    return ", ".join([GIORNI_SETTIMANA[d] for d in banned_list if d < len(GIORNI_SETTIMANA)])
 
 # ─── FUNZIONI JSON CONFIG ─────────────────────────────────────────────────────
 def build_config_payload():
@@ -526,7 +465,6 @@ if uploaded_file is not None:
     tab_wfa, tab_opt = st.tabs(["📊 Walk-Forward", "⚙️ Ottimizzatore"])
 
     with tab_wfa:
-        # ── Pulsante lancia WFA
         st.markdown("---")
         col_launch, col_info = st.columns([3, 7])
         with col_launch:
@@ -662,7 +600,6 @@ if uploaded_file is not None:
                 }
                 st.success("✅ Elaborazione completata!")
 
-        # ── Risultati WFA
         if st.session_state.get("wfa_results") is not None:
             res           = st.session_state["wfa_results"]
             final_oos_df  = res["final_oos_df"]
@@ -774,7 +711,6 @@ if uploaded_file is not None:
 
     # ─── TAB OTTIMIZZATORE ────────────────────────────────────────────────────
     with tab_opt:
-        # Prepara df preprocessato con colonne standardizzate per l'ottimizzatore
         df_opt = df_raw.copy()
         df_opt['Date Closed'] = pd.to_datetime(df_opt['Date Closed'])
         df_opt['Date Opened'] = pd.to_datetime(df_opt['Date Opened'])
