@@ -1,7 +1,7 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 1.1.0 — 2026-05-04
+#  Versione: 1.2.0 — 2026-05-05
 #
 #  Questo modulo fornisce:
 #  - run_wfa_single(...): motore Walk-Forward parametrico per una singola combinazione
@@ -74,15 +74,7 @@ def run_wfa_single(
     strategy_col: str = "Strategy",
     pnl_col: str = "Net_PnL",
 ) -> Optional[Dict[str, float]]:
-    """Esegue un singolo loop Walk-Forward rolling e restituisce metriche OOS.
-
-    Il DataFrame deve contenere colonne:
-    - date_col: data del trade / giorno (sarà convertita in datetime)
-    - strategy_col: nome strategia
-    - pnl_col: PnL (già netto commissioni)
-
-    Non modifica df originale.
-    """
+    """Esegue un singolo loop Walk-Forward rolling e restituisce metriche OOS."""
     if df is None or df.empty:
         return None
     if any(c not in df.columns for c in (date_col, strategy_col, pnl_col)):
@@ -113,19 +105,13 @@ def run_wfa_single(
             start_is = start_oos
             continue
 
-        # ── Ranking IS per strategia (riusa compute_ranking_score di wfa_core) ──
         metrics_rows = []
         for strat, grp in is_data.groupby(strategy_col):
             if len(grp) < 5:
                 continue
-
-            # Standardizza nomi colonne per le funzioni del core
             strat_is = grp.rename(columns={date_col: "Date Closed", pnl_col: "Net PnL"})
-
-            # ROC filter opzionale (stessa logica del main)
             if params.roc_filter_enabled and not passes_roc_filter(strat_is, params.roc_filter_steps):
                 continue
-
             score, higher_is_better = compute_ranking_score(
                 strat_is, params.ranking_metric, params.roc_filter_steps
             )
@@ -149,7 +135,6 @@ def run_wfa_single(
         else:
             metrics_df = metrics_df.sort_values(["score", "total_pnl_is"], ascending=[True, False])
 
-        # ── Selezione top_n con vincolo max_per_group ───────────
         selected: List[Dict[str, object]] = []
         family_count: Dict[str, int] = {}
         for _, row in metrics_df.iterrows():
@@ -165,7 +150,6 @@ def run_wfa_single(
             start_is = start_oos
             continue
 
-        # ── Pesi (pieno / panchina) ─────────────────────────────
         n_full = min(params.full_weight_count, len(selected))
         raw_weights: Dict[str, float] = {}
         for idx, row in enumerate(selected):
@@ -179,7 +163,6 @@ def run_wfa_single(
 
         weights = {k: v / tot_w for k, v in raw_weights.items()}
 
-        # ── PnL OOS pesato ──────────────────────────────────────
         oos_sub = oos_data[oos_data[strategy_col].isin(weights.keys())]
         if oos_sub.empty:
             start_is = start_oos
@@ -216,7 +199,6 @@ def run_wfa_single(
     calmar = (total_pnl / (max_dd or 1e-9)) if max_dd > 0 else 0.0
     recovery = (total_pnl / (max_dd or 1e-9)) if max_dd > 0 else 0.0
 
-    # Sub-periodo recente (~ultimi 6 mesi trading ≈ 126 giorni)
     recent_n = max(5, min(126, pnl.size // 2))
     recent = pnl[-recent_n:]
     r_mean = float(np.mean(recent))
@@ -225,17 +207,18 @@ def run_wfa_single(
     recent_pnl = float(np.sum(recent))
     recent_dd = _max_drawdown(recent)
 
+    # ── Tutti i valori arrotondati a max 2 decimali ──────────────
     return {
-        "sharpe": round(sharpe, 4),
-        "sortino": round(sortino, 4),
-        "calmar": round(calmar, 4),
-        "total_pnl": round(total_pnl, 2),
-        "max_dd": round(max_dd, 2),
-        "recovery_factor": round(recovery, 4),
-        "recent_sharpe": round(recent_sharpe, 4),
-        "recent_pnl": round(recent_pnl, 2),
-        "recent_max_dd": round(recent_dd, 2),
-        "n_oos_days": int(pnl.size),
+        "sharpe":          round(sharpe, 2),
+        "sortino":         round(sortino, 2),
+        "calmar":          round(calmar, 2),
+        "total_pnl":       round(total_pnl, 2),
+        "max_dd":          round(max_dd, 2),
+        "recovery_factor": round(recovery, 2),
+        "recent_sharpe":   round(recent_sharpe, 2),
+        "recent_pnl":      round(recent_pnl, 2),
+        "recent_max_dd":   round(recent_dd, 2),
+        "n_oos_days":      int(pnl.size),
     }
 
 
@@ -251,11 +234,7 @@ def render_optimizer_tab(
     strategy_col: str = "Strategy",
     pnl_col: str = "Net_PnL",
 ) -> None:
-    """Renderizza la tab ⚙️ Ottimizzatore in una app Streamlit esistente.
-
-    - df_processed deve essere il DataFrame preprocessato (dopo filtri Legendary, Net PnL, ecc.).
-    - group_map mappa Strategy → famiglia (famiglie usate per max_per_group).
-    """
+    """Renderizza la tab ⚙️ Ottimizzatore in una app Streamlit esistente."""
     st.markdown("### ⚙️ Ottimizzatore Walk-Forward")
     st.caption(
         "Grid search su parametri WFA per massimizzare una metrica OOS "
@@ -266,7 +245,7 @@ def render_optimizer_tab(
         st.warning("⚠️ Carica e preprocessa prima un CSV nella tab principale.")
         return
 
-    # ── Configurazione griglia ──────────────────────────────────
+    # ── Configurazione griglia ─────────────────────────────────────────────
     with st.expander("🎛️ Configura griglia di ottimizzazione", expanded=True):
         col_chk, col_range, col_target = st.columns([1.3, 1.7, 1.1])
 
@@ -310,7 +289,7 @@ def render_optimizer_tab(
             is_months = st.number_input("IS mesi", 3, 36, 12)
             oos_days = st.number_input("OOS giorni", 7, 90, 28)
 
-    # ── Costruzione griglia di combinazioni ─────────────────────
+    # ── Costruzione griglia di combinazioni ─────────────────────────────
 
     def _fixed_session(key: str, default):
         return [st.session_state.get(key, default)]
@@ -424,7 +403,7 @@ def render_optimizer_tab(
         st.session_state["wfa_opt_results"] = df_res
         st.session_state["wfa_opt_target"] = target_metric
 
-    # ── Visualizzazione risultati ────────────────────────────────
+    # ── Visualizzazione risultati ──────────────────────────────────────
     if "wfa_opt_results" not in st.session_state:
         return
 
@@ -463,8 +442,20 @@ def render_optimizer_tab(
             return ["background-color:#2a1a1a;color:#fca5a5"] * len(row)
         return [""] * len(row)
 
+    # Formattatori colonne (max 2 decimali)
+    float_cols = ["sharpe", "sortino", "calmar", "recovery_factor", "recent_sharpe"]
+    money_cols = ["total_pnl", "recent_pnl", "max_dd", "recent_max_dd"]
+
+    display_df = top20[show_cols].copy()
+    for col in float_cols:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].map(lambda v: f"{v:.2f}")
+    for col in money_cols:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].map(lambda v: f"{v:,.2f}")
+
     st.dataframe(
-        top20[show_cols].style.apply(_style, axis=1),
+        display_df.style.apply(_style, axis=1),
         use_container_width=True,
         height=480,
     )
@@ -475,42 +466,44 @@ def render_optimizer_tab(
     st.markdown("#### 🥇 Combinazione ottimale")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("📈 Sharpe OOS", f"{best.sharpe:.3f}")
-    c2.metric("📊 Sortino OOS", f"{best.sortino:.3f}")
-    c3.metric("📉 Calmar OOS", f"{best.calmar:.3f}")
-    c4.metric("💰 Total PnL OOS", f"{best.total_pnl:,.0f}")
-    c5.metric("🔄 Recovery Factor", f"{best.recovery_factor:.3f}")
+    c1.metric("📈 Sharpe OOS",        f"{best['sharpe']:.2f}")
+    c2.metric("📊 Sortino OOS",       f"{best['sortino']:.2f}")
+    c3.metric("📉 Calmar OOS",        f"{best['calmar']:.2f}")
+    c4.metric("💰 Total PnL OOS",     f"${best['total_pnl']:,.2f}")
+    c5.metric("🔄 Recovery Factor",   f"{best['recovery_factor']:.2f}")
 
     st.markdown(
-        f"`top_n={int(best.top_n)}` · "
-        f"`full_weight_count={int(best.full_weight_count)}` · "
-        f"`full_weight_pct={int(best.full_weight_pct)}%` · "
-        f"`bench_weight_pct={int(best.bench_weight_pct)}%` · "
-        f"`max_per_group={int(best.max_per_group)}` · "
-        f"`ranking_metric={best.ranking_metric}` · "
-        f"`roc_filter={bool(best.roc_filter)}` · "
-        f"`roc_steps={int(best.roc_steps)}`"
+        f"`top_n={int(best['top_n'])}` · "
+        f"`full_weight_count={int(best['full_weight_count'])}` · "
+        f"`full_weight_pct={int(best['full_weight_pct'])}%` · "
+        f"`bench_weight_pct={int(best['bench_weight_pct'])}%` · "
+        f"`max_per_group={int(best['max_per_group'])}` · "
+        f"`ranking_metric={best['ranking_metric']}` · "
+        f"`roc_filter={bool(best['roc_filter'])}` · "
+        f"`roc_steps={int(best['roc_steps'])}`"
     )
 
     if best.get("overfit_flag", "🟢 No") == "🔴 Sì":
         st.warning(
-            f"⚠️ Anti-overfitting: Sharpe recente {best.recent_sharpe:.3f} < 50% di Sharpe storico {best.sharpe:.3f}."
+            f"⚠️ Anti-overfitting: Sharpe recente {best['recent_sharpe']:.2f} "
+            f"< 50% di Sharpe storico {best['sharpe']:.2f}."
         )
     else:
         st.success(
-            f"✅ Stabilità buona: Sharpe recente {best.recent_sharpe:.3f} vs storico {best.sharpe:.3f}."
+            f"✅ Stabilità buona: Sharpe recente {best['recent_sharpe']:.2f} "
+            f"vs storico {best['sharpe']:.2f}."
         )
 
     # Pulsante applica
     if st.button("⚡ Applica questa configurazione", type="primary"):
-        st.session_state["top_n"] = int(best.top_n)
-        st.session_state["full_weight_count"] = int(best.full_weight_count)
-        st.session_state["full_weight_pct"] = int(best.full_weight_pct)
-        st.session_state["bench_weight_pct"] = int(best.bench_weight_pct)
-        st.session_state["max_per_group"] = int(best.max_per_group)
-        st.session_state["ranking_metric"] = str(best.ranking_metric)
-        st.session_state["roc_filter_enabled"] = bool(best.roc_filter)
-        st.session_state["roc_filter_steps"] = int(best.roc_steps)
+        st.session_state["top_n"] = int(best["top_n"])
+        st.session_state["full_weight_count"] = int(best["full_weight_count"])
+        st.session_state["full_weight_pct"] = int(best["full_weight_pct"])
+        st.session_state["bench_weight_pct"] = int(best["bench_weight_pct"])
+        st.session_state["max_per_group"] = int(best["max_per_group"])
+        st.session_state["ranking_metric"] = str(best["ranking_metric"])
+        st.session_state["roc_filter_enabled"] = bool(best["roc_filter"])
+        st.session_state["roc_filter_steps"] = int(best["roc_steps"])
         st.success("Configurazione salvata in session_state — torna alla tab principale e riesegui il WFA.")
         st.rerun()
 
