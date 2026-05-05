@@ -1,12 +1,13 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 1.6.0 — 2026-05-05
-#  Changelog v1.6:
-#    - Ripristinati run_wfa_single_windowed, compute_robustness_profile,
-#      render_robustness_section (scatter XY + box plot)
-#    - Rimossi definitivamente: overfit_flag, recent_sharpe/pnl/max_dd,
-#      bar chart "Sharpe storico vs recente"
+#  Versione: 1.7.0 — 2026-05-05
+#  Changelog v1.7:
+#    - FIX CRITICO: rolling OOS step corretto in run_wfa_single
+#      e run_wfa_single_windowed.
+#      start_is ora avanza di `oos_days` giorni ad ogni iterazione
+#      (rolling 28gg) invece di saltare a start_oos (che produceva
+#      una finestra per anno invece che una ogni 28 giorni).
 #
 #  Questo modulo fornisce:
 #  - run_wfa_single(...)             : motore WFA aggregato (grid search)
@@ -157,6 +158,7 @@ def _select_strategies(
 
 # ─────────────────────────────────────────────────────────────────
 # CORE: singolo loop WFA — aggregato (grid search veloce)
+# FIX v1.7: start_is avanza di oos_days giorni (rolling corretto)
 # ─────────────────────────────────────────────────────────────────
 
 def run_wfa_single(
@@ -185,7 +187,9 @@ def run_wfa_single(
     max_date = df[date_col].max()
     all_oos_pnl: List[float] = []
 
+    oos_step = pd.Timedelta(days=params.oos_days)
     start_is = min_date
+
     while True:
         end_is = start_is + relativedelta(months=params.is_months) - pd.Timedelta(days=1)
         start_oos = end_is + pd.Timedelta(days=1)
@@ -198,19 +202,19 @@ def run_wfa_single(
         oos_data = df[(df[date_col] >= start_oos) & (df[date_col] <= end_oos)]
 
         if is_data.empty or oos_data.empty:
-            start_is = start_oos
+            start_is += oos_step
             continue
 
         weights, banned_per_strat = _select_strategies(
             is_data, params, group_map, strategy_col, date_col, pnl_col
         )
         if not weights:
-            start_is = start_oos
+            start_is += oos_step
             continue
 
         oos_sub = oos_data[oos_data[strategy_col].isin(weights.keys())].copy()
         if oos_sub.empty:
-            start_is = start_oos
+            start_is += oos_step
             continue
 
         if has_weekday:
@@ -221,7 +225,7 @@ def run_wfa_single(
             oos_sub = oos_sub[~mask]
 
         if oos_sub.empty:
-            start_is = start_oos
+            start_is += oos_step
             continue
 
         oos_daily = (
@@ -233,7 +237,9 @@ def run_wfa_single(
         )
         daily_agg = oos_daily.groupby(date_col)["weighted_pnl"].sum()
         all_oos_pnl.extend(daily_agg.to_list())
-        start_is = start_oos
+
+        # FIX v1.7: avanza di oos_days (rolling), non salta a start_oos
+        start_is += oos_step
 
     if len(all_oos_pnl) < 5:
         return None
@@ -265,6 +271,7 @@ def run_wfa_single(
 
 # ─────────────────────────────────────────────────────────────────
 # CORE: singolo loop WFA — per finestra OOS (analisi robustezza)
+# FIX v1.7: start_is avanza di oos_days giorni (rolling corretto)
 # ─────────────────────────────────────────────────────────────────
 
 def run_wfa_single_windowed(
@@ -294,7 +301,9 @@ def run_wfa_single_windowed(
     windows: List[Dict] = []
     window_idx = 0
 
+    oos_step = pd.Timedelta(days=params.oos_days)
     start_is = min_date
+
     while True:
         end_is = start_is + relativedelta(months=params.is_months) - pd.Timedelta(days=1)
         start_oos = end_is + pd.Timedelta(days=1)
@@ -307,19 +316,19 @@ def run_wfa_single_windowed(
         oos_data = df[(df[date_col] >= start_oos) & (df[date_col] <= end_oos)]
 
         if is_data.empty or oos_data.empty:
-            start_is = start_oos
+            start_is += oos_step
             continue
 
         weights, banned_per_strat = _select_strategies(
             is_data, params, group_map, strategy_col, date_col, pnl_col
         )
         if not weights:
-            start_is = start_oos
+            start_is += oos_step
             continue
 
         oos_sub = oos_data[oos_data[strategy_col].isin(weights.keys())].copy()
         if oos_sub.empty:
-            start_is = start_oos
+            start_is += oos_step
             continue
 
         if has_weekday:
@@ -330,7 +339,7 @@ def run_wfa_single_windowed(
             oos_sub = oos_sub[~mask]
 
         if oos_sub.empty:
-            start_is = start_oos
+            start_is += oos_step
             continue
 
         oos_sub = oos_sub.copy()
@@ -353,7 +362,8 @@ def run_wfa_single_windowed(
             "total_pnl": round(float(sum(trade_pnls)), 2),
         })
 
-        start_is = start_oos
+        # FIX v1.7: avanza di oos_days (rolling), non salta a start_oos
+        start_is += oos_step
 
     return windows
 
