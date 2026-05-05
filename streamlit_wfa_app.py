@@ -267,18 +267,20 @@ def apply_config_payload(payload, all_strategies):
     st.session_state["roc_filter_steps"]  = max(1, int(payload.get("roc_filter_steps",   DEFAULT_ROC_FILTER_STEPS)))
 
 # ─── INIT SESSION STATE ───────────────────────────────────────────────────────
-for key, default in [
-    ("top_n",             DEFAULT_TOP_N),
-    ("full_weight_count", DEFAULT_FULL_WEIGHT_COUNT),
-    ("full_weight_pct",   DEFAULT_FULL_WEIGHT_PCT),
-    ("bench_weight_pct",  DEFAULT_BENCH_WEIGHT_PCT),
-    ("ranking_metric",    DEFAULT_RANKING_METRIC),
-    ("roc_steps",         DEFAULT_ROC_STEPS),
-    ("roc_filter_enabled",DEFAULT_ROC_FILTER_ENABLED),
-    ("roc_filter_steps",  DEFAULT_ROC_FILTER_STEPS),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+_SS_DEFAULTS = {
+    "top_n":              DEFAULT_TOP_N,
+    "full_weight_count":  DEFAULT_FULL_WEIGHT_COUNT,
+    "full_weight_pct":    DEFAULT_FULL_WEIGHT_PCT,
+    "bench_weight_pct":   DEFAULT_BENCH_WEIGHT_PCT,
+    "ranking_metric":     DEFAULT_RANKING_METRIC,
+    "roc_steps":          DEFAULT_ROC_STEPS,
+    "roc_filter_enabled": DEFAULT_ROC_FILTER_ENABLED,
+    "roc_filter_steps":   DEFAULT_ROC_FILTER_STEPS,
+    "max_per_group":      DEFAULT_MAX_PER_GROUP,
+}
+for _k, _v in _SS_DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
 # ─── UPLOAD CSV ───────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Carica il dataset dei trade (CSV)", type=['csv'])
@@ -299,8 +301,6 @@ if uploaded_file is not None:
         st.session_state['strategy_mapping'] = DEFAULT_GROUP_MAPPING.copy()
     if 'group_names' not in st.session_state:
         st.session_state['group_names'] = sorted(set(DEFAULT_GROUP_MAPPING.values()))
-    if 'max_per_group' not in st.session_state:
-        st.session_state['max_per_group'] = DEFAULT_MAX_PER_GROUP
     for strat in all_strategies_in_file:
         if strat not in st.session_state['strategy_mapping']:
             st.session_state['strategy_mapping'][strat] = ''
@@ -335,74 +335,89 @@ if uploaded_file is not None:
 
     st.sidebar.divider()
 
+    # ── Parametri WFA — FIX: key= nativo, nessuna scrittura manuale su session_state ──
     st.sidebar.subheader("🎛️ Parametri WFA")
-    top_n = st.sidebar.number_input("Numero strategie selezionate (Top-N)",
-        min_value=1, max_value=20, value=st.session_state["top_n"], step=1, help="Default: 7")
-    st.session_state["top_n"] = int(top_n)
 
-    full_weight_count = st.sidebar.number_input("Strategie con peso pieno (rank 1…N)",
-        min_value=0, max_value=int(top_n),
-        value=min(st.session_state["full_weight_count"], int(top_n)), step=1)
-    st.session_state["full_weight_count"] = int(full_weight_count)
+    st.sidebar.number_input(
+        "Numero strategie selezionate (Top-N)",
+        min_value=1, max_value=20, step=1,
+        help="Default: 7",
+        key="top_n",
+    )
 
-    full_weight_pct = st.sidebar.number_input("Peso pieno (%)",
-        min_value=1, max_value=100, value=st.session_state["full_weight_pct"], step=5)
-    st.session_state["full_weight_pct"] = int(full_weight_pct)
+    st.sidebar.number_input(
+        "Strategie con peso pieno (rank 1…N)",
+        min_value=0, max_value=int(st.session_state["top_n"]),
+        step=1,
+        key="full_weight_count",
+    )
 
-    bench_weight_pct = st.sidebar.number_input("Peso panchina (%)",
-        min_value=1, max_value=100, value=st.session_state["bench_weight_pct"], step=5)
-    st.session_state["bench_weight_pct"] = int(bench_weight_pct)
+    st.sidebar.number_input(
+        "Peso pieno (%)",
+        min_value=1, max_value=100, step=5,
+        key="full_weight_pct",
+    )
 
-    bench_count = int(top_n) - int(full_weight_count)
-    st.sidebar.markdown(f"**Schema:** {int(full_weight_count)}×{int(full_weight_pct)}% + {bench_count}×{int(bench_weight_pct)}%")
+    st.sidebar.number_input(
+        "Peso panchina (%)",
+        min_value=1, max_value=100, step=5,
+        key="bench_weight_pct",
+    )
+
+    _bench_count = int(st.session_state["top_n"]) - int(st.session_state["full_weight_count"])
+    st.sidebar.markdown(
+        f"**Schema:** {int(st.session_state['full_weight_count'])}×"
+        f"{int(st.session_state['full_weight_pct'])}% + "
+        f"{_bench_count}×{int(st.session_state['bench_weight_pct'])}%"
+    )
     st.sidebar.divider()
 
     st.sidebar.subheader("🏆 Metrica di Ranking IS")
     ranking_metric_idx = RANKING_METRICS.index(st.session_state["ranking_metric"]) \
         if st.session_state["ranking_metric"] in RANKING_METRICS else 0
-    ranking_metric = st.sidebar.selectbox(
+    st.sidebar.selectbox(
         "Metrica per ordinare le strategie nella finestra IS",
         options=RANKING_METRICS, index=ranking_metric_idx,
-        help="Omega Ratio: default. Ulcer Index: minore = migliore. ROC: PnL netto su N finestre OOS."
+        help="Omega Ratio: default. Ulcer Index: minore = migliore. ROC: PnL netto su N finestre OOS.",
+        key="ranking_metric",
     )
-    st.session_state["ranking_metric"] = ranking_metric
 
-    roc_steps = st.session_state["roc_steps"]
-    if ranking_metric == "ROC":
-        roc_steps = st.sidebar.number_input(
+    if st.session_state["ranking_metric"] == "ROC":
+        st.sidebar.number_input(
             f"Finestra ROC (multipli di {OOS_STEP_DAYS}gg)",
-            min_value=1, max_value=24, value=st.session_state["roc_steps"], step=1,
-            help=f"Es. 2 = finestra di {2*OOS_STEP_DAYS} giorni."
+            min_value=1, max_value=24, step=1,
+            help=f"Es. 2 = finestra di {2*OOS_STEP_DAYS} giorni.",
+            key="roc_steps",
         )
-        st.session_state["roc_steps"] = int(roc_steps)
-        st.sidebar.caption(f"📅 Finestra ROC attiva: **{int(roc_steps) * OOS_STEP_DAYS} giorni**")
+        st.sidebar.caption(f"📅 Finestra ROC attiva: **{int(st.session_state['roc_steps']) * OOS_STEP_DAYS} giorni**")
     st.sidebar.divider()
 
     st.sidebar.subheader("🚫 Filtro ROC < 0")
-    roc_filter_enabled = st.sidebar.toggle(
+    st.sidebar.toggle(
         "Attiva filtro ROC < 0",
-        value=st.session_state["roc_filter_enabled"],
-        help="Se attivo, esclude le strategie con Net PnL negativo sulla finestra configurata."
+        help="Se attivo, esclude le strategie con Net PnL negativo sulla finestra configurata.",
+        key="roc_filter_enabled",
     )
-    st.session_state["roc_filter_enabled"] = roc_filter_enabled
 
-    roc_filter_steps = st.session_state["roc_filter_steps"]
-    if roc_filter_enabled:
-        roc_filter_steps = st.sidebar.number_input(
+    if st.session_state["roc_filter_enabled"]:
+        st.sidebar.number_input(
             f"Finestra filtro ROC (multipli di {OOS_STEP_DAYS}gg)",
-            min_value=1, max_value=24, value=st.session_state["roc_filter_steps"], step=1
+            min_value=1, max_value=24, step=1,
+            key="roc_filter_steps",
         )
-        st.session_state["roc_filter_steps"] = int(roc_filter_steps)
         st.sidebar.caption(
-            f"📅 Finestra filtro ROC: **{int(roc_filter_steps) * OOS_STEP_DAYS} giorni**"
+            f"📅 Finestra filtro ROC: **{int(st.session_state['roc_filter_steps']) * OOS_STEP_DAYS} giorni**"
         )
     st.sidebar.divider()
 
     st.sidebar.subheader("Limite per gruppo")
-    max_per_group = st.sidebar.number_input("Max strategie stesso gruppo",
-        min_value=1, max_value=int(top_n),
-        value=min(st.session_state['max_per_group'], int(top_n)), step=1, help="Default 2")
-    st.session_state['max_per_group'] = int(max_per_group)
+    st.sidebar.number_input(
+        "Max strategie stesso gruppo",
+        min_value=1, max_value=int(st.session_state["top_n"]),
+        step=1,
+        help="Default 2",
+        key="max_per_group",
+    )
     st.sidebar.divider()
 
     st.sidebar.subheader("Gestione gruppi")
@@ -461,6 +476,18 @@ if uploaded_file is not None:
         st.info("Apri la sidebar (▶), assegna un gruppo a ogni strategia e salva.")
         st.stop()
 
+    # Alias leggibili per il resto del codice
+    top_n            = int(st.session_state["top_n"])
+    full_weight_count= int(st.session_state["full_weight_count"])
+    full_weight_pct  = int(st.session_state["full_weight_pct"])
+    bench_weight_pct = int(st.session_state["bench_weight_pct"])
+    max_per_group    = int(st.session_state["max_per_group"])
+    ranking_metric   = st.session_state["ranking_metric"]
+    roc_steps        = int(st.session_state["roc_steps"])
+    roc_filter_enabled = bool(st.session_state["roc_filter_enabled"])
+    roc_filter_steps = int(st.session_state["roc_filter_steps"])
+    bench_count      = top_n - full_weight_count
+
     # ─── TAB PRINCIPALI ───────────────────────────────────────────────────────
     tab_wfa, tab_opt = st.tabs(["📊 Walk-Forward", "⚙️ Ottimizzatore"])
 
@@ -472,32 +499,32 @@ if uploaded_file is not None:
         with col_info:
             roc_filter_label = (
                 f" &nbsp;|&nbsp; 🚫 ROC filter: <b style='color:#ef4444'>"
-                f"{int(roc_filter_steps)*OOS_STEP_DAYS}gg</b>"
+                f"{roc_filter_steps*OOS_STEP_DAYS}gg</b>"
             ) if roc_filter_enabled else ""
             ranking_label_color = "#f59e0b" if ranking_metric != "Omega Ratio" else "#00d4ff"
             st.markdown(
                 f"<div style='padding-top:10px; color:#7a9abf; font-size:0.88rem;'>"
                 f"Ranking: <b style='color:{ranking_label_color}'>{ranking_metric}</b>"
-                + (f" ({int(roc_steps)*OOS_STEP_DAYS}gg)" if ranking_metric=="ROC" else "")
-                + f" &nbsp;|&nbsp; Top-N: <b style='color:#00d4ff'>{int(top_n)}</b>"
-                f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{int(full_weight_count)}×{int(full_weight_pct)}%</b>"
-                f" + <b style='color:#f59e0b'>{bench_count}×{int(bench_weight_pct)}%</b>"
-                f" &nbsp;|&nbsp; Max/gr: <b style='color:#00d4ff'>{int(max_per_group)}</b>"
+                + (f" ({roc_steps*OOS_STEP_DAYS}gg)" if ranking_metric=="ROC" else "")
+                + f" &nbsp;|&nbsp; Top-N: <b style='color:#00d4ff'>{top_n}</b>"
+                f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{full_weight_count}×{full_weight_pct}%</b>"
+                f" + <b style='color:#f59e0b'>{bench_count}×{bench_weight_pct}%</b>"
+                f" &nbsp;|&nbsp; Max/gr: <b style='color:#00d4ff'>{max_per_group}</b>"
                 + roc_filter_label + "</div>",
                 unsafe_allow_html=True
             )
 
         if launch:
-            _top_n    = int(st.session_state["top_n"])
-            _fwc      = int(st.session_state["full_weight_count"])
-            _fwp      = st.session_state["full_weight_pct"] / 100.0
-            _bwp      = st.session_state["bench_weight_pct"] / 100.0
-            _mpg      = int(st.session_state["max_per_group"])
-            _sm       = dict(st.session_state["strategy_mapping"])
-            _metric   = st.session_state["ranking_metric"]
-            _roc_s    = int(st.session_state["roc_steps"])
-            _roc_fe   = bool(st.session_state["roc_filter_enabled"])
-            _roc_fs   = int(st.session_state["roc_filter_steps"])
+            _top_n    = top_n
+            _fwc      = full_weight_count
+            _fwp      = full_weight_pct / 100.0
+            _bwp      = bench_weight_pct / 100.0
+            _mpg      = max_per_group
+            _sm       = dict(strategy_mapping)
+            _metric   = ranking_metric
+            _roc_s    = roc_steps
+            _roc_fe   = roc_filter_enabled
+            _roc_fs   = roc_filter_steps
 
             with st.spinner("Elaborazione Walk-Forward in corso..."):
                 df_filtered = df_raw.copy()
@@ -722,6 +749,9 @@ if uploaded_file is not None:
             - df_opt['Opening Commissions + Fees']
             - df_opt['Closing Commissions + Fees']
         )
+        df_opt['weekday_open'] = df_opt['Date Opened'].dt.weekday
+        df_opt = df_opt.sort_values('Date Closed').reset_index(drop=True)
+
         render_optimizer_tab(
             df_processed=df_opt,
             group_map=st.session_state['strategy_mapping'],
@@ -729,6 +759,3 @@ if uploaded_file is not None:
             strategy_col='Strategy',
             pnl_col='Net PnL',
         )
-
-else:
-    st.info("⬆️ Carica un file CSV per iniziare.")
