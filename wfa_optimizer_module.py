@@ -1,7 +1,7 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 1.3.0 — 2026-05-05
+#  Versione: 1.3.1 — 2026-05-05  (fix box plot marker color list)
 #
 #  Questo modulo fornisce:
 #  - run_wfa_single(...): motore Walk-Forward aggregato (grid search veloce)
@@ -529,7 +529,6 @@ def render_robustness_section(
             [r["dd_pct"] for r in valid],
         )),
         hovertemplate=(
-            "<b>%{text_labels}</b><br>"
             "%{meta}<br>"
             f"<b>{target_metric}:</b> %{{x:.2f}}<br>"
             "<b>PF P25:</b> %{y:.2f}<br>"
@@ -631,27 +630,47 @@ def render_robustness_section(
     mc3.metric("% finestre PF>1", f"{prof['pf_pct_above_1']*100:.0f}%")
     mc4.metric("% finestre DD<soglia", f"{prof['dd_pct_below_thresh']*100:.0f}%")
 
-    # Box plot + jitter
+    # ── Box plot — FIX: go.Box senza boxpoints + go.Scatter overlay per colori per-punto
+    # Plotly non supporta marker.color come lista dentro go.Box con boxpoints="all".
+    # Soluzione: box puro per la forma statistica, poi Scatter overlay per i jitter points
+    # con colori individuali.
+    rng = np.random.default_rng(42)
+    jitter_x = rng.uniform(-0.25, 0.25, size=len(pf_vals_sel)).tolist()
+    point_colors = ["#6ee7b7" if v >= 1.0 else "#f87171" for v in pf_vals_sel]
+    hover_texts = [
+        f"Finestra {i+1}<br>PF: {v:.2f}" for i, v in enumerate(pf_vals_sel)
+    ]
+
     fig_box = go.Figure()
 
+    # Trace 1: box statistico (no punti individuali)
     fig_box.add_trace(go.Box(
         y=pf_vals_sel,
+        x=[0] * len(pf_vals_sel),
         name="PF per finestra",
         marker_color="#4f98a3",
         line_color="#4f98a3",
         fillcolor="rgba(79,152,163,0.25)",
-        boxpoints="all",
-        jitter=0.35,
-        pointpos=0,
+        boxpoints=False,
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+    # Trace 2: scatter overlay con colori per-punto (verde PF≥1, rosso PF<1)
+    fig_box.add_trace(go.Scatter(
+        x=jitter_x,
+        y=pf_vals_sel,
+        mode="markers",
         marker=dict(
-            size=7,
-            color=[
-                "#6ee7b7" if v >= 1.0 else "#f87171"
-                for v in pf_vals_sel
-            ],
+            size=8,
+            color=point_colors,
             line=dict(color="#0d1117", width=1),
+            opacity=0.9,
         ),
-        hovertemplate="Finestra %{pointNumber+1}<br>PF: %{y:.2f}<extra></extra>",
+        text=hover_texts,
+        hovertemplate="%{text}<extra></extra>",
+        showlegend=False,
+        name="Punti",
     ))
 
     # Linea PF = 1.0
@@ -670,6 +689,12 @@ def render_robustness_section(
         paper_bgcolor="#0d1117",
         plot_bgcolor="#131920",
         font=dict(color="#e0eaf4"),
+        xaxis=dict(
+            showticklabels=False,
+            zeroline=False,
+            showgrid=False,
+            range=[-1, 1],
+        ),
         yaxis=dict(
             title="Profit Factor",
             gridcolor="#1e2a35",
