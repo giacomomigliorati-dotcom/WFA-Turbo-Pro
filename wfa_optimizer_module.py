@@ -1,7 +1,9 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 1.3.1 — 2026-05-05  (fix box plot marker color list)
+#  Versione: 1.4.0 — 2026-05-05
+#  Fix 1: CUSUM Weekday Killer applicato in IS + filtro weekday_open in OOS
+#  Fix 2: pesi assoluti (rimossa normalizzazione) — allineato all'app originale
 #
 #  Questo modulo fornisce:
 #  - run_wfa_single(...): motore Walk-Forward aggregato (grid search veloce)
@@ -16,7 +18,7 @@ from __future__ import annotations
 import itertools
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -30,6 +32,8 @@ from wfa_core import (
     DEFAULT_RANKING_METRIC,
     compute_ranking_score,
     passes_roc_filter,
+    compute_cusum_banned,
+    format_banned_days,
 )
 
 
@@ -66,7 +70,6 @@ def _max_drawdown(arr: np.ndarray) -> float:
 
 
 def _profit_factor(pnl_list: List[float]) -> float:
-    """Profit Factor = somma wins / somma abs(losses). Restituisce 0.0 se no losses."""
     arr = np.asarray(pnl_list, dtype=float)
     wins = arr[arr > 0].sum()
     losses = abs(arr[arr < 0].sum())
@@ -82,28 +85,53 @@ def _select_strategies(
     strategy_col: str,
     date_col: str,
     pnl_col: str,
-) -> Dict[str, float]:
-    """Logica IS comune: ranking + selezione + pesi. Restituisce dict {strategia: peso}."""
+) -> Tuple[Dict[str, float], Dict[str, List[int]]]:
+    """Logica IS comune: ranking + CUSUM + selezione + pesi assoluti.
+
+    FIX 1: applica compute_cusum_banned per ogni strategia IS.
+           Esclude strategie con tutti i giorni bannati.
+    FIX 2: restituisce pesi assoluti (non normalizzati), identici all'app originale.
+
+    Restituisce:
+        weights: dict {strategia: peso_assoluto}
+        banned_per_strat: dict {strategia: lista_weekday_bannati}
+    """
     metrics_rows = []
     for strat, grp in is_data.groupby(strategy_col):
         if len(grp) < 5:
             continue
+
+        # Rinomina per compatibilità con wfa_core (aspetta 'Date Closed' e 'Net PnL')
         strat_is = grp.rename(columns={date_col: "Date Closed", pnl_col: "Net PnL"})
+
         if params.roc_filter_enabled and not passes_roc_filter(strat_is, params.roc_filter_steps):
             continue
+
         score, higher_is_better = compute_ranking_score(
             strat_is, params.ranking_metric, params.roc_filter_steps
         )
+
+        # FIX 1 — CUSUM Weekday Killer
+        banned_days: List[int] = []
+        if "weekday_open" in strat_is.columns:
+            banned_days = compute_cusum_banned(strat_is)
+            active_days = strat_is["weekday_open"].unique().tolist()
+            remaining = [d for d in active_days if d not in banned_days]
+            if not remaining:
+                # Tutti i giorni bannati: escludi questa strategia
+                continue
+
         metrics_rows.append({
             "strategy": strat,
             "score": score,
             "family": group_map.get(strat, "Unknown"),
             "total_pnl_is": float(strat_is["Net PnL"].sum()),
             "higher_is_better": higher_is_better,
+            "banned_days": banned_days,
         })
 
     if not metrics_rows:
-        return {}
+        return {}, {}
 
     metrics_df = pd.DataFrame(metrics_rows)
     asc = not bool(metrics_df["higher_is_better"].all())
@@ -122,18 +150,20 @@ def _select_strategies(
             break
 
     if not selected:
-        return {}
+        return {}, {}
 
     n_full = min(params.full_weight_count, len(selected))
-    raw_weights: Dict[str, float] = {}
+
+    # FIX 2 — pesi assoluti (no normalizzazione), identici all'app originale
+    weights: Dict[str, float] = {}
+    banned_per_strat: Dict[str, List[int]] = {}
     for idx, row in enumerate(selected):
         w = params.full_weight_pct if idx < n_full else params.bench_weight_pct
-        raw_weights[str(row["strategy"])] = w / 100.0
+        strat_name = str(row["strategy"])
+        weights[strat_name] = w / 100.0
+        banned_per_strat[strat_name] = row.get("banned_days", [])
 
-    tot_w = sum(raw_weights.values())
-    if tot_w <= 0:
-        return {}
-    return {k: v / tot_w for k, v in raw_weights.items()}
+    return weights, banned_per_strat
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -149,15 +179,23 @@ def run_wfa_single(
     strategy_col: str = "Strategy",
     pnl_col: str = "Net_PnL",
 ) -> Optional[Dict[str, float]]:
-    """Esegue un singolo loop Walk-Forward rolling e restituisce metriche OOS aggregate."""
+    """Esegue un singolo loop Walk-Forward rolling e restituisce metriche OOS aggregate.
+
+    FIX 1: applica il filtro weekday_open (CUSUM) in OOS per ogni strategia.
+    FIX 2: usa pesi assoluti restituiti da _select_strategies.
+    """
     if df is None or df.empty:
         return None
     if any(c not in df.columns for c in (date_col, strategy_col, pnl_col)):
         return None
 
-    df = df[[date_col, strategy_col, pnl_col]].copy()
+    df = df[[date_col, strategy_col, pnl_col] + (
+        ["weekday_open"] if "weekday_open" in df.columns else []
+    )].copy()
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.sort_values(date_col).reset_index(drop=True)
+
+    has_weekday = "weekday_open" in df.columns
 
     min_date = df[date_col].min()
     max_date = df[date_col].max()
@@ -179,12 +217,26 @@ def run_wfa_single(
             start_is = start_oos
             continue
 
-        weights = _select_strategies(is_data, params, group_map, strategy_col, date_col, pnl_col)
+        weights, banned_per_strat = _select_strategies(
+            is_data, params, group_map, strategy_col, date_col, pnl_col
+        )
         if not weights:
             start_is = start_oos
             continue
 
-        oos_sub = oos_data[oos_data[strategy_col].isin(weights.keys())]
+        oos_sub = oos_data[oos_data[strategy_col].isin(weights.keys())].copy()
+        if oos_sub.empty:
+            start_is = start_oos
+            continue
+
+        # FIX 1 — filtra trade OOS su weekday_open bannati per strategia
+        if has_weekday:
+            mask = oos_sub.apply(
+                lambda r: r["weekday_open"] in banned_per_strat.get(r[strategy_col], []),
+                axis=1,
+            )
+            oos_sub = oos_sub[~mask]
+
         if oos_sub.empty:
             start_is = start_oos
             continue
@@ -254,22 +306,21 @@ def run_wfa_single_windowed(
 ) -> List[Dict]:
     """Variante di run_wfa_single che restituisce metriche per ogni finestra OOS separata.
 
-    Ogni elemento della lista corrisponde a una finestra OOS e contiene:
-    - window (int): indice progressivo
-    - start_oos, end_oos (str): date della finestra
-    - pf (float): Profit Factor della finestra
-    - max_dd (float): max drawdown intra-finestra
-    - n_trade (int): numero trade nella finestra
-    - total_pnl (float): PnL totale pesato della finestra
+    FIX 1: applica il filtro weekday_open (CUSUM) in OOS.
+    FIX 2: usa pesi assoluti.
     """
     if df is None or df.empty:
         return []
     if any(c not in df.columns for c in (date_col, strategy_col, pnl_col)):
         return []
 
-    df = df[[date_col, strategy_col, pnl_col]].copy()
+    df = df[[date_col, strategy_col, pnl_col] + (
+        ["weekday_open"] if "weekday_open" in df.columns else []
+    )].copy()
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.sort_values(date_col).reset_index(drop=True)
+
+    has_weekday = "weekday_open" in df.columns
 
     min_date = df[date_col].min()
     max_date = df[date_col].max()
@@ -292,7 +343,9 @@ def run_wfa_single_windowed(
             start_is = start_oos
             continue
 
-        weights = _select_strategies(is_data, params, group_map, strategy_col, date_col, pnl_col)
+        weights, banned_per_strat = _select_strategies(
+            is_data, params, group_map, strategy_col, date_col, pnl_col
+        )
         if not weights:
             start_is = start_oos
             continue
@@ -302,13 +355,24 @@ def run_wfa_single_windowed(
             start_is = start_oos
             continue
 
-        # PnL pesato per singolo trade (non aggregato per giorno → serve per PF)
+        # FIX 1 — filtra trade OOS su weekday_open bannati
+        if has_weekday:
+            mask = oos_sub.apply(
+                lambda r: r["weekday_open"] in banned_per_strat.get(r[strategy_col], []),
+                axis=1,
+            )
+            oos_sub = oos_sub[~mask]
+
+        if oos_sub.empty:
+            start_is = start_oos
+            continue
+
+        oos_sub = oos_sub.copy()
         oos_sub["weighted_pnl"] = oos_sub.apply(
             lambda r: r[pnl_col] * weights.get(r[strategy_col], 0.0), axis=1
         )
         trade_pnls = oos_sub["weighted_pnl"].tolist()
 
-        # Aggrega per giorno per max_dd
         oos_sub_daily = oos_sub.groupby(date_col)["weighted_pnl"].sum()
         daily_arr = np.asarray(oos_sub_daily.tolist(), dtype=float)
 
@@ -336,11 +400,6 @@ def compute_robustness_profile(
     windows: List[Dict],
     dd_threshold: float = 0.15,
 ) -> Optional[Dict]:
-    """Calcola il profilo di robustezza aggregato da una lista di finestre OOS.
-
-    dd_threshold: soglia max_dd assoluta (es. 0.15 = $150 su conto $1000).
-    Restituisce None se windows è vuoto o ha meno di 3 finestre valide.
-    """
     if not windows or len(windows) < 3:
         return None
 
@@ -352,15 +411,15 @@ def compute_robustness_profile(
     dd_vals = [w["max_dd"] for w in windows]
 
     return {
-        "pf_median":          round(float(np.median(pf_arr)), 2),
-        "pf_p25":             round(float(np.percentile(pf_arr, 25)), 2),
-        "pf_pct_above_1":     round(float(np.mean(pf_arr > 1.0)), 2),
+        "pf_median":           round(float(np.median(pf_arr)), 2),
+        "pf_p25":              round(float(np.percentile(pf_arr, 25)), 2),
+        "pf_pct_above_1":      round(float(np.mean(pf_arr > 1.0)), 2),
         "dd_pct_below_thresh": round(float(np.mean(np.asarray(dd_vals) < dd_threshold)), 2),
-        "n_windows":          len(windows),
-        "n_windows_valid":    len(pf_vals),
-        "pf_per_window":      [w["pf"] for w in windows],
-        "dd_per_window":      dd_vals,
-        "windows_detail":     windows,
+        "n_windows":           len(windows),
+        "n_windows_valid":     len(pf_vals),
+        "pf_per_window":       [w["pf"] for w in windows],
+        "dd_per_window":       dd_vals,
+        "windows_detail":      windows,
     }
 
 
@@ -378,12 +437,6 @@ def render_robustness_section(
     pnl_col: str = "Net_PnL",
     target_metric: str = "calmar",
 ) -> None:
-    """Sezione analisi di robustezza post-ottimizzazione.
-
-    Riesegue i 20 run windowed sulle Top-20 combinazioni, poi mostra:
-    1. Scatter XY: metrica target (asse X) vs PF P25 (asse Y)
-    2. Box plot PF per finestra OOS della combinazione selezionata
-    """
     st.markdown("---")
     st.markdown("### 🔬 Analisi di Robustezza — Top 20")
     st.caption(
@@ -395,16 +448,14 @@ def render_robustness_section(
         st.warning("⚠️ Dati non disponibili per l'analisi di robustezza.")
         return
 
-    # ── Controllo soglia drawdown ──────────────────────────────────────
     dd_threshold = st.slider(
         "📉 Soglia Max Drawdown per colore scatter ($)",
         min_value=50, max_value=2000, value=150, step=50,
-        help="Finestre OOS con max_dd < questa soglia vengono considerate 'sicure' per il colore dei punti.",
+        help="Finestre OOS con max_dd < questa soglia vengono considerate 'sicure'.",
         key="robustness_dd_threshold",
     )
     dd_thresh_val = float(dd_threshold)
 
-    # ── Riesecuzione windowed sulle Top-20 ────────────────────────────
     cache_key = "wfa_robustness_cache"
     top20 = df_res.head(20).copy()
 
@@ -441,7 +492,6 @@ def render_robustness_section(
     else:
         profiles = st.session_state[cache_key]
 
-    # ── Costruzione dati scatter ───────────────────────────────────────
     scatter_rows = []
     for i, (_, row) in enumerate(top20.iterrows()):
         prof = profiles[i] if i < len(profiles) else None
@@ -449,7 +499,6 @@ def render_robustness_section(
         pf_pct = prof["pf_pct_above_1"] if prof else 0.0
         dd_pct = prof["dd_pct_below_thresh"] if prof else 0.0
 
-        # Ricalcola dd_pct_below_thresh con la soglia slider corrente
         if prof and "dd_per_window" in prof:
             dd_arr = np.asarray(prof["dd_per_window"], dtype=float)
             dd_pct = float(np.mean(dd_arr < dd_thresh_val))
@@ -458,8 +507,8 @@ def render_robustness_section(
             "rank":        int(row["Rank"]),
             "target_val":  float(row.get(target_metric, 0.0)),
             "pf_p25":      pf_p25,
-            "pf_pct":      round(pf_pct * 100, 1),   # % finestre PF>1
-            "dd_pct":      round(dd_pct * 100, 1),    # % finestre dd<soglia
+            "pf_pct":      round(pf_pct * 100, 1),
+            "dd_pct":      round(dd_pct * 100, 1),
             "label":       (
                 f"Rank {int(row['Rank'])} | "
                 f"top_n={int(row['top_n'])} | "
@@ -476,7 +525,6 @@ def render_robustness_section(
         st.warning("Nessuna combinazione ha prodotto finestre OOS sufficienti per l'analisi.")
         return
 
-    # ── Scatter XY ────────────────────────────────────────────────────
     st.markdown(f"#### 📊 Scatter: {target_metric.capitalize()} vs PF P25 per finestra OOS")
     st.caption(
         "**Asse X** = metrica target aggregata · "
@@ -490,13 +538,9 @@ def render_robustness_section(
     size_vals   = [max(8.0, r["pf_pct"] * 0.4) for r in valid]
     color_vals  = [r["dd_pct"] for r in valid]
     labels      = [r["label"] for r in valid]
-    ranks       = [r["rank"] for r in valid]
-
-    # Testo visibile solo per rank 1-3
     text_labels = [str(r["rank"]) if r["rank"] <= 3 else "" for r in valid]
 
     fig_scatter = go.Figure()
-
     fig_scatter.add_trace(go.Scatter(
         x=target_vals,
         y=pf_p25_vals,
@@ -508,10 +552,10 @@ def render_robustness_section(
             size=size_vals,
             color=color_vals,
             colorscale=[
-                [0.0, "#7f1d1d"],   # rosso scuro — DD frequente
-                [0.4, "#b45309"],   # arancio
-                [0.7, "#065f46"],   # verde scuro
-                [1.0, "#6ee7b7"],   # verde chiaro — DD raro
+                [0.0, "#7f1d1d"],
+                [0.4, "#b45309"],
+                [0.7, "#065f46"],
+                [1.0, "#6ee7b7"],
             ],
             cmin=0, cmax=100,
             colorbar=dict(
@@ -524,7 +568,7 @@ def render_robustness_section(
             opacity=0.92,
         ),
         customdata=list(zip(
-            ranks,
+            [r["rank"] for r in valid],
             [r["pf_pct"] for r in valid],
             [r["dd_pct"] for r in valid],
         )),
@@ -540,7 +584,6 @@ def render_robustness_section(
         name="Combinazioni",
     ))
 
-    # Linea orizzontale PF = 1.0
     fig_scatter.add_hline(
         y=1.0,
         line_dash="dash",
@@ -551,7 +594,6 @@ def render_robustness_section(
         annotation_font=dict(color="#ef4444", size=10),
     )
 
-    # Annotazioni per rank 1-3
     for r in valid:
         if r["rank"] <= 3:
             fig_scatter.add_annotation(
@@ -582,15 +624,11 @@ def render_robustness_section(
         margin=dict(l=60, r=80, t=40, b=60),
         showlegend=False,
     )
-
     st.plotly_chart(fig_scatter, use_container_width=True)
 
     if invalid:
-        st.caption(
-            f"⚠️ {len(invalid)} combinazioni escluse dallo scatter per dati OOS insufficienti."
-        )
+        st.caption(f"⚠️ {len(invalid)} combinazioni escluse dallo scatter per dati OOS insufficienti.")
 
-    # ── Selectbox + Box plot on-demand ────────────────────────────────
     st.markdown("---")
     st.markdown("#### 🔎 Dettaglio combinazione — Box Plot PF per finestra OOS")
 
@@ -623,27 +661,18 @@ def render_robustness_section(
     n_win = prof["n_windows"]
     windows_detail = prof["windows_detail"]
 
-    # Metriche rapide
     mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("PF Mediana",      f"{prof['pf_median']:.2f}")
-    mc2.metric("PF P25",          f"{prof['pf_p25']:.2f}")
-    mc3.metric("% finestre PF>1", f"{prof['pf_pct_above_1']*100:.0f}%")
+    mc1.metric("PF Mediana",           f"{prof['pf_median']:.2f}")
+    mc2.metric("PF P25",               f"{prof['pf_p25']:.2f}")
+    mc3.metric("% finestre PF>1",      f"{prof['pf_pct_above_1']*100:.0f}%")
     mc4.metric("% finestre DD<soglia", f"{prof['dd_pct_below_thresh']*100:.0f}%")
 
-    # ── Box plot — FIX: go.Box senza boxpoints + go.Scatter overlay per colori per-punto
-    # Plotly non supporta marker.color come lista dentro go.Box con boxpoints="all".
-    # Soluzione: box puro per la forma statistica, poi Scatter overlay per i jitter points
-    # con colori individuali.
     rng = np.random.default_rng(42)
     jitter_x = rng.uniform(-0.25, 0.25, size=len(pf_vals_sel)).tolist()
     point_colors = ["#6ee7b7" if v >= 1.0 else "#f87171" for v in pf_vals_sel]
-    hover_texts = [
-        f"Finestra {i+1}<br>PF: {v:.2f}" for i, v in enumerate(pf_vals_sel)
-    ]
+    hover_texts = [f"Finestra {i+1}<br>PF: {v:.2f}" for i, v in enumerate(pf_vals_sel)]
 
     fig_box = go.Figure()
-
-    # Trace 1: box statistico (no punti individuali)
     fig_box.add_trace(go.Box(
         y=pf_vals_sel,
         x=[0] * len(pf_vals_sel),
@@ -655,8 +684,6 @@ def render_robustness_section(
         showlegend=False,
         hoverinfo="skip",
     ))
-
-    # Trace 2: scatter overlay con colori per-punto (verde PF≥1, rosso PF<1)
     fig_box.add_trace(go.Scatter(
         x=jitter_x,
         y=pf_vals_sel,
@@ -672,8 +699,6 @@ def render_robustness_section(
         showlegend=False,
         name="Punti",
     ))
-
-    # Linea PF = 1.0
     fig_box.add_hline(
         y=1.0,
         line_dash="dash",
@@ -683,22 +708,13 @@ def render_robustness_section(
         annotation_position="bottom right",
         annotation_font=dict(color="#ef4444", size=10),
     )
-
     fig_box.update_layout(
         template="plotly_dark",
         paper_bgcolor="#0d1117",
         plot_bgcolor="#131920",
         font=dict(color="#e0eaf4"),
-        xaxis=dict(
-            showticklabels=False,
-            zeroline=False,
-            showgrid=False,
-            range=[-1, 1],
-        ),
-        yaxis=dict(
-            title="Profit Factor",
-            gridcolor="#1e2a35",
-        ),
+        xaxis=dict(showticklabels=False, zeroline=False, showgrid=False, range=[-1, 1]),
+        yaxis=dict(title="Profit Factor", gridcolor="#1e2a35"),
         height=360,
         margin=dict(l=60, r=40, t=40, b=40),
         showlegend=False,
@@ -710,15 +726,14 @@ def render_robustness_section(
     )
     st.plotly_chart(fig_box, use_container_width=True)
 
-    # Mini-tabella finestre cronologica
     with st.expander("📋 Dettaglio finestre OOS (cronologico)", expanded=False):
         detail_df = pd.DataFrame(windows_detail)
         detail_df["semaforo"] = detail_df["pf"].apply(
             lambda v: "🟢" if v >= 1.2 else ("🟡" if v >= 1.0 else "🔴")
         )
-        detail_df["pf"]       = detail_df["pf"].map(lambda v: f"{v:.2f}")
-        detail_df["max_dd"]   = detail_df["max_dd"].map(lambda v: f"{v:,.2f}")
-        detail_df["total_pnl"]= detail_df["total_pnl"].map(lambda v: f"{v:,.2f}")
+        detail_df["pf"]        = detail_df["pf"].map(lambda v: f"{v:.2f}")
+        detail_df["max_dd"]    = detail_df["max_dd"].map(lambda v: f"{v:,.2f}")
+        detail_df["total_pnl"] = detail_df["total_pnl"].map(lambda v: f"{v:,.2f}")
         st.dataframe(
             detail_df[["window", "start_oos", "end_oos", "pf", "max_dd", "n_trade", "total_pnl", "semaforo"]],
             use_container_width=True,
@@ -727,7 +742,7 @@ def render_robustness_section(
 
 
 # ─────────────────────────────────────────────────────────────────
-# UI: render_optimizer_tab  (invariata + chiamata robustezza in coda)
+# UI: render_optimizer_tab
 # ─────────────────────────────────────────────────────────────────
 
 def render_optimizer_tab(
@@ -738,7 +753,6 @@ def render_optimizer_tab(
     strategy_col: str = "Strategy",
     pnl_col: str = "Net_PnL",
 ) -> None:
-    """Renderizza la tab ⚙️ Ottimizzatore in una app Streamlit esistente."""
     st.markdown("### ⚙️ Ottimizzatore Walk-Forward")
     st.caption(
         "Grid search su parametri WFA per massimizzare una metrica OOS "
@@ -765,14 +779,14 @@ def render_optimizer_tab(
 
         with col_range:
             st.markdown("**Range / Valori**")
-            top_n_min       = st.number_input("top_n min", 1, 20, 5)
-            top_n_max       = st.number_input("top_n max", 1, 20, 10)
-            fwc_min         = st.number_input("full_weight_count min", 1, 20, 3)
-            fwp_values      = st.multiselect("full_weight_pct (%)", [70, 80, 90, 100], [70, 80, 90, 100])
-            bwp_values      = st.multiselect("bench_weight_pct (%)", [30, 40, 50, 60], [30, 40])
-            mpg_min         = st.number_input("max_per_group min", 1, 5, 1)
-            mpg_max         = st.number_input("max_per_group max", 1, 5, 3)
-            roc_steps_values= st.multiselect("roc_filter_steps", [1, 2, 3, 4], [1, 2, 3])
+            top_n_min        = st.number_input("top_n min", 1, 20, 5)
+            top_n_max        = st.number_input("top_n max", 1, 20, 10)
+            fwc_min          = st.number_input("full_weight_count min", 1, 20, 3)
+            fwp_values       = st.multiselect("full_weight_pct (%)", [70, 80, 90, 100], [70, 80, 90, 100])
+            bwp_values       = st.multiselect("bench_weight_pct (%)", [30, 40, 50, 60], [30, 40])
+            mpg_min          = st.number_input("max_per_group min", 1, 5, 1)
+            mpg_max          = st.number_input("max_per_group max", 1, 5, 3)
+            roc_steps_values = st.multiselect("roc_filter_steps", [1, 2, 3, 4], [1, 2, 3])
 
         with col_target:
             st.markdown("**Metrica target**")
@@ -795,14 +809,14 @@ def render_optimizer_tab(
     def _fixed_session(key: str, default):
         return [st.session_state.get(key, default)]
 
-    top_n_range   = list(range(int(top_n_min), int(top_n_max) + 1)) if use_top_n   else _fixed_session("top_n", 7)
-    fwc_range     = list(range(int(fwc_min), int(top_n_max) + 1))   if use_fwc     else _fixed_session("full_weight_count", 3)
-    fwp_range     = fwp_values or [80]                                if use_fwp     else _fixed_session("full_weight_pct", 80)
-    bwp_range     = bwp_values or [40]                                if use_bwp     else _fixed_session("bench_weight_pct", 40)
-    mpg_range     = list(range(int(mpg_min), int(mpg_max) + 1))      if use_mpg     else _fixed_session("max_per_group", 2)
-    rank_range    = RANKING_METRICS                                    if use_rank    else _fixed_session("ranking_metric", DEFAULT_RANKING_METRIC)
-    roc_en_range  = [True, False]                                      if use_roc_en  else _fixed_session("roc_filter_enabled", True)
-    roc_steps_range = roc_steps_values or [2]                          if use_roc_steps else _fixed_session("roc_filter_steps", 2)
+    top_n_range    = list(range(int(top_n_min), int(top_n_max) + 1)) if use_top_n    else _fixed_session("top_n", 7)
+    fwc_range      = list(range(int(fwc_min), int(top_n_max) + 1))   if use_fwc      else _fixed_session("full_weight_count", 3)
+    fwp_range      = fwp_values or [80]                               if use_fwp      else _fixed_session("full_weight_pct", 80)
+    bwp_range      = bwp_values or [40]                               if use_bwp      else _fixed_session("bench_weight_pct", 40)
+    mpg_range      = list(range(int(mpg_min), int(mpg_max) + 1))     if use_mpg      else _fixed_session("max_per_group", 2)
+    rank_range     = RANKING_METRICS                                   if use_rank     else _fixed_session("ranking_metric", DEFAULT_RANKING_METRIC)
+    roc_en_range   = [True, False]                                     if use_roc_en   else _fixed_session("roc_filter_enabled", True)
+    roc_steps_range= roc_steps_values or [2]                          if use_roc_steps else _fixed_session("roc_filter_steps", 2)
 
     raw_grid = list(itertools.product(
         top_n_range, fwc_range, fwp_range, bwp_range,
@@ -875,7 +889,6 @@ def render_optimizer_tab(
         )
         st.session_state["wfa_opt_results"] = df_res
         st.session_state["wfa_opt_target"]  = target_metric
-        # Invalida cache robustezza al nuovo run
         st.session_state.pop("wfa_robustness_cache", None)
 
     if "wfa_opt_results" not in st.session_state:
@@ -959,7 +972,6 @@ def render_optimizer_tab(
         st.success("Configurazione salvata in session_state — torna alla tab principale e riesegui il WFA.")
         st.rerun()
 
-    # Grafico Sharpe storico vs recente
     st.markdown("---")
     st.markdown("#### 🔍 Sharpe storico vs recente (Top 20)")
 
@@ -981,7 +993,6 @@ def render_optimizer_tab(
     )
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    # ── Sezione robustezza (scatter XY + box plot) ─────────────────
     render_robustness_section(
         df_res=top20,
         df_processed=df_processed,
@@ -992,7 +1003,6 @@ def render_optimizer_tab(
         target_metric=st.session_state.get("wfa_opt_target", target_metric),
     )
 
-    # Export CSV completo
     st.markdown("---")
     csv_bytes = df_res.to_csv(index=False).encode("utf-8")
     st.download_button(
