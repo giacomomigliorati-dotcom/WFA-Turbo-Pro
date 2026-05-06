@@ -1,7 +1,24 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 1.9.0 — 2026-05-06
+#  Versione: 2.0.0 — 2026-05-06
+#  Changelog v2.0.0:
+#    - run_wfa_single_windowed: aggiunto campo "selected_strategies"
+#      (List[str]) al dict di ogni finestra OOS — contiene le chiavi
+#      del dict weights calcolato da _select_strategies.
+#    - render_robustness_section: dopo il box plot PF e l'expander
+#      dettaglio finestre, aggiunti due nuovi grafici per la combo
+#      selezionata nella selectbox:
+#        1. Bar chart verticale PnL per finestra OOS (verde se >0,
+#           rosso se <=0), con linea di riferimento a y=0 e hover
+#           completo (finestra, date, PnL, PF).
+#        2. Bar chart orizzontale frequenza strategie: quante finestre
+#           OOS ha coperto ogni strategia, con percentuale sul bar e
+#           colore attenuato per frequenze < 50%.
+#    - selected_strategies è già incluso in windows_detail →
+#      va nel JSON esportato automaticamente senza modifiche a
+#      _export_run_json.
+#
 #  Changelog v1.9.0:
 #    - Import aggiuntivi: hashlib, json, datetime/timezone.
 #    - Aggiunto helper _dataset_hash(df): hash MD5 riproducibile
@@ -56,6 +73,7 @@ import itertools
 import json
 import math
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -468,14 +486,15 @@ def run_wfa_single_windowed(
 
         window_idx += 1
         windows.append({
-            "window":    window_idx,
-            "start_oos": str(start_oos.date()),
-            "end_oos":   str(end_oos.date()),
-            "pf":        _profit_factor(trade_pnls),
-            "max_dd":    round(_max_drawdown(daily_arr), 2),
-            "tuw":       _time_under_water(daily_arr),
-            "n_trade":   len(trade_pnls),
-            "total_pnl": round(float(sum(trade_pnls)), 2),
+            "window":              window_idx,
+            "start_oos":           str(start_oos.date()),
+            "end_oos":             str(end_oos.date()),
+            "pf":                  _profit_factor(trade_pnls),
+            "max_dd":              round(_max_drawdown(daily_arr), 2),
+            "tuw":                 _time_under_water(daily_arr),
+            "n_trade":             len(trade_pnls),
+            "total_pnl":           round(float(sum(trade_pnls)), 2),
+            "selected_strategies": list(weights.keys()),
         })
 
         start_is += oos_step
@@ -913,6 +932,138 @@ def render_robustness_section(
             detail_df[show_cols],
             use_container_width=True,
             hide_index=True,
+        )
+
+    # ── Visualizzazione 2: Bar chart PnL per finestra OOS ──────────────────
+    st.markdown("#### 📅 PnL per finestra OOS")
+    st.caption(
+        "Verde = finestra profittevole · Rosso = finestra in perdita · "
+        "Linea tratteggiata = break-even · Hover per dettaglio."
+    )
+
+    win_labels  = [f"W{w['window']}\n{w['start_oos'][:7]}" for w in windows_detail]
+    win_pnl     = [w["total_pnl"] for w in windows_detail]
+    win_pf      = [w["pf"] for w in windows_detail]
+    win_start   = [w["start_oos"] for w in windows_detail]
+    win_end     = [w["end_oos"] for w in windows_detail]
+    bar_colors  = ["#6ee7b7" if v > 0 else "#f87171" for v in win_pnl]
+
+    fig_pnl = go.Figure()
+    fig_pnl.add_trace(go.Bar(
+        x=win_labels,
+        y=win_pnl,
+        marker_color=bar_colors,
+        marker_line=dict(color="#0d1117", width=0.8),
+        customdata=list(zip(win_start, win_end, win_pf)),
+        hovertemplate=(
+            "<b>Finestra %{x}</b><br>"
+            "Dal %{customdata[0]} al %{customdata[1]}<br>"
+            "<b>PnL:</b> $%{y:,.2f}<br>"
+            "<b>PF:</b> %{customdata[2]:.2f}<br>"
+            "<extra></extra>"
+        ),
+        name="PnL finestra",
+        showlegend=False,
+    ))
+    fig_pnl.add_hline(
+        y=0,
+        line_dash="dash",
+        line_color="#9ca3af",
+        line_width=1.2,
+    )
+    fig_pnl.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0d1117",
+        plot_bgcolor="#131920",
+        font=dict(color="#e0eaf4"),
+        xaxis=dict(
+            title="Finestra OOS",
+            gridcolor="#1e2a35",
+            tickangle=-45 if len(win_labels) > 8 else 0,
+        ),
+        yaxis=dict(
+            title="Total PnL ($)",
+            gridcolor="#1e2a35",
+            tickprefix="$",
+            separatethousands=True,
+            zeroline=False,
+        ),
+        height=320,
+        margin=dict(l=70, r=40, t=30, b=60),
+        bargap=0.25,
+    )
+    st.plotly_chart(fig_pnl, use_container_width=True)
+
+    # ── Visualizzazione 1: Frequenza strategie nelle finestre OOS ──────────
+    all_selected: List[str] = []
+    for w in windows_detail:
+        all_selected.extend(w.get("selected_strategies", []))
+
+    if all_selected:
+        st.markdown("#### 🧩 Frequenza strategie nelle finestre OOS")
+        st.caption(
+            "Quante finestre OOS ha coperto ogni strategia selezionata in IS. "
+            "Barre più chiare = presente in meno del 50% delle finestre."
+        )
+
+        freq_counter = Counter(all_selected)
+        n_total_windows = len(windows_detail)
+
+        # Ordine discendente per frequenza
+        strat_names = [s for s, _ in freq_counter.most_common()]
+        strat_counts = [freq_counter[s] for s in strat_names]
+        strat_pcts   = [freq_counter[s] / n_total_windows * 100 for s in strat_names]
+
+        # Colore: teal pieno se >= 50%, teal attenuato se < 50%
+        bar_colors_strat = [
+            "#4f98a3" if (freq_counter[s] / n_total_windows) >= 0.5 else "#2a5560"
+            for s in strat_names
+        ]
+
+        fig_freq = go.Figure()
+        fig_freq.add_trace(go.Bar(
+            x=strat_counts,
+            y=strat_names,
+            orientation="h",
+            marker_color=bar_colors_strat,
+            marker_line=dict(color="#0d1117", width=0.6),
+            text=[f"{p:.0f}%" for p in strat_pcts],
+            textposition="outside",
+            textfont=dict(color="#e0eaf4", size=11),
+            customdata=strat_pcts,
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Presente in <b>%{x}</b> finestre su " + str(n_total_windows) + "<br>"
+                "Frequenza: <b>%{customdata:.1f}%</b><br>"
+                "<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+        fig_freq.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#0d1117",
+            plot_bgcolor="#131920",
+            font=dict(color="#e0eaf4"),
+            xaxis=dict(
+                title="N° finestre OOS",
+                gridcolor="#1e2a35",
+                range=[0, n_total_windows * 1.18],  # spazio per le label %
+                zeroline=False,
+            ),
+            yaxis=dict(
+                title="",
+                gridcolor="#1e2a35",
+                automargin=True,
+            ),
+            height=max(260, len(strat_names) * 28 + 80),
+            margin=dict(l=20, r=80, t=30, b=50),
+            bargap=0.3,
+        )
+        st.plotly_chart(fig_freq, use_container_width=True)
+    else:
+        st.caption(
+            "ℹ️ Dati `selected_strategies` non disponibili per questa combo "
+            "(run calcolata prima della v2.0.0). Ricalcola la robustezza per visualizzare il grafico."
         )
 
 
