@@ -1,7 +1,14 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 1.7.0 — 2026-05-05
+#  Versione: 1.7.1 — 2026-05-06
+#  Changelog v1.7.1:
+#    - Slider soglia Max Drawdown: max_value esteso da 2000 a 10000.
+#    - Aggiunta spiegazione dettagliata nel tooltip (?) dello slider:
+#      chiarisce che il DD è assoluto in $, calcolato per singola
+#      finestra OOS (intra-finestra), e che il colore scatter
+#      rappresenta la % di finestre sotto soglia (non il DD stesso).
+#
 #  Changelog v1.7:
 #    - FIX CRITICO: rolling OOS step corretto in run_wfa_single
 #      e run_wfa_single_windowed.
@@ -424,10 +431,31 @@ def render_robustness_section(
         st.warning("⚠️ Dati non disponibili per l'analisi di robustezza.")
         return
 
+    _DD_SLIDER_HELP = (
+        "Soglia di drawdown massimo accettabile per singola finestra OOS, espressa in dollari ($).\n\n"
+        "**Come viene calcolato il Max DD**\n"
+        "Il drawdown è calcolato in termini assoluti (monetari, non percentuali): "
+        "è la caduta massima picco-a-valle dell'equity cumulata ponderata all'interno "
+        "di ogni singola finestra OOS (tipicamente 28 giorni). "
+        "Ogni finestra riparte da zero — quindi si tratta di un drawdown intra-finestra, "
+        "non calcolato sull'intero storico.\n\n"
+        "**A cosa serve questa soglia**\n"
+        "Non filtra né elimina combinazioni: cambia il colore dei punti nello scatter. "
+        "Per ogni combinazione nel Top 20, viene calcolata la percentuale di finestre OOS "
+        "in cui il max_dd è rimasto sotto questa soglia. "
+        "Quella percentuale determina il colore del punto (rosso = poche finestre sicure, "
+        "verde = la maggior parte delle finestre rimane sotto soglia).\n\n"
+        "**Perché il colore è in percentuale e non in $**\n"
+        "Lo scatter vuole mostrare la consistenza del rischio nel tempo, non il valore "
+        "puntuale di un singolo drawdown. Alzare la soglia rende più combinazioni 'sicure' "
+        "(più verde); abbassarla è più selettivo e solo i portafogli con drawdown molto "
+        "contenuti per finestra appaiono verdi."
+    )
+
     dd_threshold = st.slider(
         "📉 Soglia Max Drawdown per colore scatter ($)",
-        min_value=50, max_value=2000, value=150, step=50,
-        help="Finestre OOS con max_dd < questa soglia vengono considerate 'sicure'.",
+        min_value=50, max_value=10000, value=150, step=50,
+        help=_DD_SLIDER_HELP,
         key="robustness_dd_threshold",
     )
     dd_thresh_val = float(dd_threshold)
