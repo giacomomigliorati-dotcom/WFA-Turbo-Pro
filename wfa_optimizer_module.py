@@ -1,20 +1,29 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 1.7.1 — 2026-05-06
+#  Versione: 1.8.0 — 2026-05-06
+#  Changelog v1.8.0:
+#    - Aggiunto helper _time_under_water(arr): calcola il numero
+#      massimo di giorni consecutivi sotto il picco equity per
+#      ogni finestra OOS (intra-finestra).
+#    - run_wfa_single_windowed: aggiunto campo "tuw" per finestra.
+#    - compute_robustness_profile: aggiunto tuw_per_window e
+#      tuw_median nel profilo restituito.
+#    - render_robustness_section: aggiunta selectbox "Dimensione
+#      cerchi" con 9 opzioni selezionabili dall'utente:
+#        % finestre PF>1, N° finestre OOS, PF Mediana,
+#        Max DD OOS ($), Total PnL OOS, Time Under Water (mediana gg),
+#        Sharpe OOS, Sortino OOS, Calmar OOS.
+#      Per metriche "meno è meglio" (Max DD, TUW) la dimensione
+#      viene invertita: cerchi grandi = valori più bassi.
+#
 #  Changelog v1.7.1:
 #    - Slider soglia Max Drawdown: max_value esteso da 2000 a 10000.
-#    - Aggiunta spiegazione dettagliata nel tooltip (?) dello slider:
-#      chiarisce che il DD è assoluto in $, calcolato per singola
-#      finestra OOS (intra-finestra), e che il colore scatter
-#      rappresenta la % di finestre sotto soglia (non il DD stesso).
+#    - Aggiunta spiegazione dettagliata nel tooltip (?) dello slider.
 #
 #  Changelog v1.7:
 #    - FIX CRITICO: rolling OOS step corretto in run_wfa_single
 #      e run_wfa_single_windowed.
-#      start_is ora avanza di `oos_days` giorni ad ogni iterazione
-#      (rolling 28gg) invece di saltare a start_oos (che produceva
-#      una finestra per anno invece che una ogni 28 giorni).
 #
 #  Questo modulo fornisce:
 #  - run_wfa_single(...)             : motore WFA aggregato (grid search)
@@ -77,6 +86,24 @@ def _max_drawdown(arr: np.ndarray) -> float:
     dd = cum - peak
     mdd = float(np.min(dd))
     return abs(mdd) if mdd < 0 else 0.0
+
+
+def _time_under_water(arr: np.ndarray) -> int:
+    """Numero massimo di giorni consecutivi con equity sotto il picco precedente."""
+    if arr.size == 0:
+        return 0
+    cum = np.cumsum(arr)
+    peak = np.maximum.accumulate(cum)
+    underwater = (cum < peak).astype(int)
+    max_tuw = 0
+    current = 0
+    for v in underwater:
+        if v:
+            current += 1
+            max_tuw = max(max_tuw, current)
+        else:
+            current = 0
+    return max_tuw
 
 
 def _profit_factor(pnl_list: List[float]) -> float:
@@ -165,7 +192,6 @@ def _select_strategies(
 
 # ─────────────────────────────────────────────────────────────────
 # CORE: singolo loop WFA — aggregato (grid search veloce)
-# FIX v1.7: start_is avanza di oos_days giorni (rolling corretto)
 # ─────────────────────────────────────────────────────────────────
 
 def run_wfa_single(
@@ -245,7 +271,6 @@ def run_wfa_single(
         daily_agg = oos_daily.groupby(date_col)["weighted_pnl"].sum()
         all_oos_pnl.extend(daily_agg.to_list())
 
-        # FIX v1.7: avanza di oos_days (rolling), non salta a start_oos
         start_is += oos_step
 
     if len(all_oos_pnl) < 5:
@@ -278,7 +303,6 @@ def run_wfa_single(
 
 # ─────────────────────────────────────────────────────────────────
 # CORE: singolo loop WFA — per finestra OOS (analisi robustezza)
-# FIX v1.7: start_is avanza di oos_days giorni (rolling corretto)
 # ─────────────────────────────────────────────────────────────────
 
 def run_wfa_single_windowed(
@@ -365,11 +389,11 @@ def run_wfa_single_windowed(
             "end_oos":   str(end_oos.date()),
             "pf":        _profit_factor(trade_pnls),
             "max_dd":    round(_max_drawdown(daily_arr), 2),
+            "tuw":       _time_under_water(daily_arr),
             "n_trade":   len(trade_pnls),
             "total_pnl": round(float(sum(trade_pnls)), 2),
         })
 
-        # FIX v1.7: avanza di oos_days (rolling), non salta a start_oos
         start_is += oos_step
 
     return windows
@@ -392,18 +416,61 @@ def compute_robustness_profile(
 
     pf_arr = np.asarray(pf_vals, dtype=float)
     dd_vals = [w["max_dd"] for w in windows]
+    tuw_vals = [w["tuw"] for w in windows]
 
     return {
         "pf_median":           round(float(np.median(pf_arr)), 2),
         "pf_p25":              round(float(np.percentile(pf_arr, 25)), 2),
         "pf_pct_above_1":      round(float(np.mean(pf_arr > 1.0)), 2),
         "dd_pct_below_thresh": round(float(np.mean(np.asarray(dd_vals) < dd_threshold)), 2),
+        "tuw_median":          int(round(float(np.median(tuw_vals)))),
         "n_windows":           len(windows),
         "n_windows_valid":     len(pf_vals),
         "pf_per_window":       [w["pf"] for w in windows],
         "dd_per_window":       dd_vals,
+        "tuw_per_window":      tuw_vals,
         "windows_detail":      windows,
     }
+
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIGURAZIONE OPZIONI DIMENSIONE CERCHI SCATTER
+# ─────────────────────────────────────────────────────────────────
+
+# Ogni entry: (label UI, chiave nel dict scatter_row, fonte, invert)
+# invert=True significa "meno è meglio" → dimensione invertita
+_SIZE_OPTIONS: List[Tuple[str, str, str, bool]] = [
+    ("% finestre PF > 1",          "pf_pct",    "profile", False),
+    ("N° finestre OOS",             "n_windows", "profile", False),
+    ("PF Mediana",                  "pf_median", "profile", False),
+    ("Max DD OOS ($) — inv.",       "max_dd",    "df_res",  True),
+    ("Total PnL OOS ($)",           "total_pnl", "df_res",  False),
+    ("Time Under Water (mediana gg) — inv.", "tuw_median", "profile", True),
+    ("Sharpe OOS",                  "sharpe",    "df_res",  False),
+    ("Sortino OOS",                 "sortino",   "df_res",  False),
+    ("Calmar OOS",                  "calmar",    "df_res",  False),
+]
+_SIZE_LABELS = [o[0] for o in _SIZE_OPTIONS]
+_SIZE_DEFAULT = "% finestre PF > 1"
+
+
+def _compute_size_vals(
+    size_key: str,
+    size_invert: bool,
+    valid_scatter: List[Dict],
+    min_px: float = 8.0,
+    max_px: float = 40.0,
+) -> List[float]:
+    """Normalizza la variabile scelta in pixel [min_px, max_px] per la dimensione cerchi."""
+    raw = [r[size_key] if r.get(size_key) is not None else 0.0 for r in valid_scatter]
+    arr = np.asarray(raw, dtype=float)
+    if size_invert:
+        arr = -arr  # inverti: valori più bassi → cerchi più grandi
+    vmin, vmax = arr.min(), arr.max()
+    if vmax == vmin:
+        return [max_px * 0.5] * len(arr)
+    normalized = (arr - vmin) / (vmax - vmin)
+    return [float(min_px + v * (max_px - min_px)) for v in normalized]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -452,13 +519,29 @@ def render_robustness_section(
         "contenuti per finestra appaiono verdi."
     )
 
-    dd_threshold = st.slider(
-        "📉 Soglia Max Drawdown per colore scatter ($)",
-        min_value=50, max_value=10000, value=150, step=50,
-        help=_DD_SLIDER_HELP,
-        key="robustness_dd_threshold",
-    )
+    ctrl_col1, ctrl_col2 = st.columns([2, 1])
+    with ctrl_col1:
+        dd_threshold = st.slider(
+            "📉 Soglia Max Drawdown per colore scatter ($)",
+            min_value=50, max_value=10000, value=150, step=50,
+            help=_DD_SLIDER_HELP,
+            key="robustness_dd_threshold",
+        )
+    with ctrl_col2:
+        size_label = st.selectbox(
+            "⚪ Dimensione cerchi",
+            options=_SIZE_LABELS,
+            index=_SIZE_LABELS.index(_SIZE_DEFAULT),
+            key="robustness_size_metric",
+            help=(
+                "Scegli la variabile da codificare nella dimensione dei cerchi nello scatter.\n"
+                "Le opzioni con '— inv.' usano scala invertita: cerchi grandi = valori più bassi "
+                "(es. Max DD basso o TUW breve sono preferibili)."
+            ),
+        )
     dd_thresh_val = float(dd_threshold)
+    size_cfg = next(o for o in _SIZE_OPTIONS if o[0] == size_label)
+    size_key, size_src, size_invert = size_cfg[1], size_cfg[2], size_cfg[3]
 
     cache_key = "wfa_robustness_cache"
     top20 = df_res.head(20).copy()
@@ -513,6 +596,16 @@ def render_robustness_section(
             "pf_p25":      pf_p25,
             "pf_pct":      round(pf_pct * 100, 1),
             "dd_pct":      round(dd_pct * 100, 1),
+            # metriche da df_res
+            "max_dd":      float(row.get("max_dd", 0.0)),
+            "total_pnl":   float(row.get("total_pnl", 0.0)),
+            "sharpe":      float(row.get("sharpe", 0.0)),
+            "sortino":     float(row.get("sortino", 0.0)),
+            "calmar":      float(row.get("calmar", 0.0)),
+            # metriche da profilo robustezza
+            "n_windows":   prof["n_windows"] if prof else 0,
+            "pf_median":   prof["pf_median"] if prof else 0.0,
+            "tuw_median":  prof["tuw_median"] if prof else 0,
             "label":       (
                 f"Rank {int(row['Rank'])} | "
                 f"top_n={int(row['top_n'])} | "
@@ -529,20 +622,22 @@ def render_robustness_section(
         st.warning("Nessuna combinazione ha prodotto finestre OOS sufficienti per l'analisi.")
         return
 
+    size_vals = _compute_size_vals(size_key, size_invert, valid)
+
     st.markdown(f"#### 📊 Scatter: {target_metric.capitalize()} vs PF P25 per finestra OOS")
     st.caption(
-        "**Asse X** = metrica target aggregata · "
-        "**Asse Y** = primo quartile del Profit Factor per finestra OOS · "
-        "**Dimensione** = % finestre con PF > 1.0 · "
-        "**Colore** = % finestre con Max DD < soglia (verde = più sicuro)"
+        f"**Asse X** = metrica target aggregata · "
+        f"**Asse Y** = primo quartile del Profit Factor per finestra OOS · "
+        f"**Dimensione** = {size_label} · "
+        f"**Colore** = % finestre con Max DD < soglia (verde = più sicuro)"
     )
 
     target_vals = [r["target_val"] for r in valid]
     pf_p25_vals = [r["pf_p25"] for r in valid]
-    size_vals   = [max(8.0, r["pf_pct"] * 0.4) for r in valid]
     color_vals  = [r["dd_pct"] for r in valid]
     labels      = [r["label"] for r in valid]
     text_labels = [str(r["rank"]) if r["rank"] <= 3 else "" for r in valid]
+    size_raw    = [r.get(size_key, 0.0) for r in valid]
 
     fig_scatter = go.Figure()
     fig_scatter.add_trace(go.Scatter(
@@ -573,15 +668,15 @@ def render_robustness_section(
         ),
         customdata=list(zip(
             [r["rank"] for r in valid],
-            [r["pf_pct"] for r in valid],
             [r["dd_pct"] for r in valid],
+            size_raw,
         )),
         hovertemplate=(
             "%{meta}<br>"
             f"<b>{target_metric}:</b> %{{x:.2f}}<br>"
             "<b>PF P25:</b> %{y:.2f}<br>"
-            "<b>% finestre PF>1:</b> %{customdata[1]:.0f}%<br>"
-            "<b>% finestre DD<soglia:</b> %{customdata[2]:.0f}%<br>"
+            "<b>% finestre DD<soglia:</b> %{customdata[1]:.0f}%<br>"
+            f"<b>{size_label}:</b> %{{customdata[2]:.2f}}<br>"
             "<extra></extra>"
         ),
         meta=labels,
@@ -654,11 +749,12 @@ def render_robustness_section(
     n_win = prof["n_windows"]
     windows_detail = prof["windows_detail"]
 
-    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
     mc1.metric("PF Mediana",           f"{prof['pf_median']:.2f}")
     mc2.metric("PF P25",               f"{prof['pf_p25']:.2f}")
     mc3.metric("% finestre PF>1",      f"{prof['pf_pct_above_1']*100:.0f}%")
     mc4.metric("% finestre DD<soglia", f"{prof['dd_pct_below_thresh']*100:.0f}%")
+    mc5.metric("TUW mediana (gg)",     f"{prof['tuw_median']}")
 
     rng = np.random.default_rng(42)
     jitter_x = rng.uniform(-0.25, 0.25, size=len(pf_vals_sel)).tolist()
@@ -727,8 +823,10 @@ def render_robustness_section(
         detail_df["pf"]        = detail_df["pf"].map(lambda v: f"{v:.2f}")
         detail_df["max_dd"]    = detail_df["max_dd"].map(lambda v: f"{v:,.2f}")
         detail_df["total_pnl"] = detail_df["total_pnl"].map(lambda v: f"{v:,.2f}")
+        show_cols = ["window", "start_oos", "end_oos", "pf", "max_dd", "tuw", "n_trade", "total_pnl", "semaforo"]
+        show_cols = [c for c in show_cols if c in detail_df.columns]
         st.dataframe(
-            detail_df[["window", "start_oos", "end_oos", "pf", "max_dd", "n_trade", "total_pnl", "semaforo"]],
+            detail_df[show_cols],
             use_container_width=True,
             hide_index=True,
         )
