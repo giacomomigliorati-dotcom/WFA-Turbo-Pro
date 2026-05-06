@@ -1,7 +1,23 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 1.8.0 — 2026-05-06
+#  Versione: 1.9.0 — 2026-05-06
+#  Changelog v1.9.0:
+#    - Import aggiuntivi: hashlib, json, datetime/timezone.
+#    - Aggiunto helper _dataset_hash(df): hash MD5 riproducibile
+#      sulle prime 500 righe del dataset.
+#    - Aggiunto helper _export_run_json(): serializza i risultati
+#      di una run in JSON scaricabile (version, exported_at,
+#      target_metric, n_combos, dataset_hash, results).
+#    - Aggiunto helper _import_run_json(): deserializza un file JSON
+#      di run, con warning se l'hash del dataset non corrisponde.
+#    - render_optimizer_tab: calcolo current_hash dopo il check
+#      df_processed is None.
+#    - render_optimizer_tab: expander "Importa risultati da run
+#      precedente" aggiunto prima della griglia di ottimizzazione.
+#    - render_optimizer_tab: bottone download JSON (reimportabile)
+#      aggiunto accanto al CSV esistente.
+#
 #  Changelog v1.8.0:
 #    - Aggiunto helper _time_under_water(arr): calcola il numero
 #      massimo di giorni consecutivi sotto il picco equity per
@@ -35,10 +51,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
+import json
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -113,6 +132,71 @@ def _profit_factor(pnl_list: List[float]) -> float:
     if losses < 1e-9:
         return wins if wins > 0 else 0.0
     return round(float(wins / losses), 2)
+
+
+def _dataset_hash(df: pd.DataFrame) -> str:
+    """Hash MD5 riproducibile sulle prime 500 righe del dataset."""
+    sample = df.head(500).to_csv(index=False).encode("utf-8")
+    return hashlib.md5(sample).hexdigest()
+
+
+def _export_run_json(
+    df_res: pd.DataFrame,
+    target_metric: str,
+    df_processed: Optional[pd.DataFrame] = None,
+) -> bytes:
+    """Serializza i risultati di una run in JSON scaricabile."""
+    payload = {
+        "version":       "1.0",
+        "exported_at":   datetime.now(timezone.utc).isoformat(),
+        "target_metric": target_metric,
+        "n_combos":      len(df_res),
+        "dataset_hash":  _dataset_hash(df_processed) if df_processed is not None else None,
+        "results":       df_res.to_dict(orient="records"),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _import_run_json(
+    raw: bytes,
+    df_processed: Optional[pd.DataFrame] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[str], Optional[str]]:
+    """
+    Deserializza un file JSON di run.
+    Restituisce (df_res, target_metric, warning_msg).
+    warning_msg è None se tutto ok, stringa se hash non corrisponde.
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        return None, None, f"❌ File non valido: {e}"
+
+    required = {"version", "target_metric", "results"}
+    if not required.issubset(payload.keys()):
+        return None, None, "❌ File JSON non riconosciuto (chiavi mancanti)."
+
+    try:
+        df_res = pd.DataFrame(payload["results"])
+        if "Rank" not in df_res.columns:
+            df_res.insert(0, "Rank", df_res.index + 1)
+    except Exception as e:
+        return None, None, f"❌ Errore nel deserializzare i risultati: {e}"
+
+    target_metric = str(payload.get("target_metric", "calmar"))
+    warn = None
+
+    if df_processed is not None and payload.get("dataset_hash"):
+        current_hash = _dataset_hash(df_processed)
+        if current_hash != payload["dataset_hash"]:
+            exported_at = payload.get("exported_at", "data sconosciuta")
+            warn = (
+                f"⚠️ Il dataset attuale **non corrisponde** a quello usato per questa run "
+                f"(esportata il {exported_at[:10]}). "
+                "I profili di robustezza verranno ricalcolati sul dataset corrente, "
+                "ma i valori di Sharpe/Calmar/PnL potrebbero non essere replicabili."
+            )
+
+    return df_res, target_metric, warn
 
 
 def _select_strategies(
@@ -854,6 +938,34 @@ def render_optimizer_tab(
         st.warning("⚠️ Carica e preprocessa prima un CSV nella tab principale.")
         return
 
+    current_hash = _dataset_hash(df_processed)
+
+    with st.expander("📂 Importa risultati da run precedente", expanded=False):
+        uploaded = st.file_uploader(
+            "Carica un file .json esportato da una run precedente",
+            type=["json"],
+            key="wfa_import_uploader",
+            help="Evita di rilanciare la stessa ottimizzazione: carica il file JSON esportato in precedenza.",
+        )
+        if uploaded is not None:
+            raw_bytes = uploaded.getvalue()
+            df_imp, metric_imp, warn_imp = _import_run_json(raw_bytes, df_processed)
+            if df_imp is None:
+                st.error(warn_imp)
+            else:
+                if warn_imp:
+                    st.warning(warn_imp)
+                st.session_state["wfa_opt_results"] = df_imp
+                st.session_state["wfa_opt_target"]  = metric_imp
+                st.session_state.pop("wfa_robustness_cache", None)
+                st.session_state.pop("wfa_robustness_n_rows", None)
+                payload_meta = json.loads(raw_bytes.decode())
+                st.success(
+                    f"✅ Run importata: **{len(df_imp)}** combinazioni · "
+                    f"target `{metric_imp}` · "
+                    f"esportata il **{payload_meta.get('exported_at','?')[:10]}**"
+                )
+
     with st.expander("🎛️ Configura griglia di ottimizzazione", expanded=True):
         col_chk, col_range, col_target = st.columns([1.3, 1.7, 1.1])
 
@@ -986,6 +1098,7 @@ def render_optimizer_tab(
         return
 
     df_res = st.session_state["wfa_opt_results"]
+    target_metric_used = st.session_state.get("wfa_opt_target", target_metric)
     top20  = df_res.head(20)
 
     st.markdown("---")
@@ -1056,7 +1169,7 @@ def render_optimizer_tab(
         date_col=date_col,
         strategy_col=strategy_col,
         pnl_col=pnl_col,
-        target_metric=st.session_state.get("wfa_opt_target", target_metric),
+        target_metric=target_metric_used,
     )
 
     st.markdown("---")
@@ -1066,4 +1179,13 @@ def render_optimizer_tab(
         data=csv_bytes,
         file_name="wfa_optimizer_results.csv",
         mime="text/csv",
+    )
+
+    json_bytes = _export_run_json(df_res, target_metric_used, df_processed)
+    st.download_button(
+        "💾 Esporta run (JSON — reimportabile)",
+        data=json_bytes,
+        file_name=f"wfa_run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json",
+        mime="application/json",
+        help="Salva i risultati in un file JSON che puoi ricaricare in futuro senza rilanciare l'ottimizzazione.",
     )
