@@ -4,6 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 import io
 import json
+from collections import Counter
 
 from wfa_core import (
     GIORNI_SETTIMANA,
@@ -23,7 +24,7 @@ from wfa_core import (
     compute_cusum_banned,
     format_banned_days,
 )
-from wfa_optimizer_module import render_optimizer_tab
+from wfa_optimizer_module import render_optimizer_tab, run_wfa_single_windowed, WFAParams
 
 st.set_page_config(page_title="Texano's Walk Forward", layout="wide")
 
@@ -208,7 +209,7 @@ def render_metrics(m, label):
     r1[0].metric("Weighted Net PnL", f"${m['Total Weighted PnL']:,.2f}")
     r1[1].metric("Totale Trade",      f"{int(m['Total Trades'])}")
     r1[2].metric("Win Rate",           f"{m['Win Rate']*100:.1f}%")
-    r1[3].metric("Profit Factor",      f"{m['Profit Factor']:.2f}" if m['Profit Factor'] != np.inf else "∞")
+    r1[3].metric("Profit Factor",      f"{m['Profit Factor']:.2f}" if m['Profit Factor'] != np.inf else "\u221e")
     r2 = st.columns(4)
     r2[0].metric("Avg Win",      f"${m['Avg Win ($)']:,.2f}")
     r2[1].metric("Avg Loss",     f"${m['Avg Loss ($)']:,.2f}")
@@ -218,7 +219,7 @@ def render_metrics(m, label):
     r3[0].metric("Sharpe Ratio",    f"{m['Sharpe Ratio']:.2f}")
     r3[1].metric("Sortino Ratio",   f"{m['Sortino Ratio']:.2f}")
     r3[2].metric("Calmar Ratio",    f"{m['Calmar Ratio']:.2f}")
-    r3[3].metric("Recovery Factor", f"{m['Recovery Factor']:.2f}" if m['Recovery Factor'] != np.inf else "∞")
+    r3[3].metric("Recovery Factor", f"{m['Recovery Factor']:.2f}" if m['Recovery Factor'] != np.inf else "\u221e")
     r4 = st.columns(3)
     r4[0].metric("Avg Daily PnL", f"${m['Avg Daily PnL ($)']:,.2f}")
     r4[1].metric("Best Day",      f"${m['Best Day ($)']:,.2f}")
@@ -306,22 +307,22 @@ if uploaded_file is not None:
             st.session_state['strategy_mapping'][strat] = ''
 
     # ─── SIDEBAR ──────────────────────────────────────────────────────────────
-    st.sidebar.header("⚙️ Configurazione")
+    st.sidebar.header("\u2699\ufe0f Configurazione")
 
-    st.sidebar.subheader("💾 Backup configurazione")
+    st.sidebar.subheader("\U0001f4be Backup configurazione")
     st.sidebar.caption("Esporta per salvare tutti i parametri. Reimporta dopo ogni refresh.")
     config_json_str = json.dumps(build_config_payload(), ensure_ascii=False, indent=2)
-    st.sidebar.download_button(label="📤 Esporta configurazione JSON",
+    st.sidebar.download_button(label="\U0001f4e4 Esporta configurazione JSON",
         data=config_json_str.encode("utf-8"), file_name="texano_config.json", mime="application/json")
-    uploaded_config = st.sidebar.file_uploader("📥 Importa configurazione JSON", type=["json"], key="config_json_uploader")
+    uploaded_config = st.sidebar.file_uploader("\U0001f4e5 Importa configurazione JSON", type=["json"], key="config_json_uploader")
     if uploaded_config is not None:
         try:
             parsed = json.loads(uploaded_config.getvalue().decode("utf-8"))
             st.session_state["pending_config_payload"] = parsed
-            st.sidebar.success("✅ JSON caricato. Premi 'Applica' per attivarlo.")
+            st.sidebar.success("\u2705 JSON caricato. Premi 'Applica' per attivarlo.")
         except Exception as e:
             st.sidebar.error(f"JSON non valido: {e}")
-    if st.sidebar.button("✅ Applica configurazione JSON"):
+    if st.sidebar.button("\u2705 Applica configurazione JSON"):
         if "pending_config_payload" not in st.session_state:
             st.sidebar.warning("Carica prima un file JSON.")
         else:
@@ -336,7 +337,7 @@ if uploaded_file is not None:
     st.sidebar.divider()
 
     # ── Parametri WFA — FIX: key= nativo, nessuna scrittura manuale su session_state ──
-    st.sidebar.subheader("🎛️ Parametri WFA")
+    st.sidebar.subheader("\U0001f3db\ufe0f Parametri WFA")
 
     st.sidebar.number_input(
         "Numero strategie selezionate (Top-N)",
@@ -346,7 +347,7 @@ if uploaded_file is not None:
     )
 
     st.sidebar.number_input(
-        "Strategie con peso pieno (rank 1…N)",
+        "Strategie con peso pieno (rank 1\u2026N)",
         min_value=0, max_value=int(st.session_state["top_n"]),
         step=1,
         key="full_weight_count",
@@ -366,13 +367,13 @@ if uploaded_file is not None:
 
     _bench_count = int(st.session_state["top_n"]) - int(st.session_state["full_weight_count"])
     st.sidebar.markdown(
-        f"**Schema:** {int(st.session_state['full_weight_count'])}×"
+        f"**Schema:** {int(st.session_state['full_weight_count'])}\u00d7"
         f"{int(st.session_state['full_weight_pct'])}% + "
-        f"{_bench_count}×{int(st.session_state['bench_weight_pct'])}%"
+        f"{_bench_count}\u00d7{int(st.session_state['bench_weight_pct'])}%"
     )
     st.sidebar.divider()
 
-    st.sidebar.subheader("🏆 Metrica di Ranking IS")
+    st.sidebar.subheader("\U0001f3c6 Metrica di Ranking IS")
     ranking_metric_idx = RANKING_METRICS.index(st.session_state["ranking_metric"]) \
         if st.session_state["ranking_metric"] in RANKING_METRICS else 0
     st.sidebar.selectbox(
@@ -389,10 +390,10 @@ if uploaded_file is not None:
             help=f"Es. 2 = finestra di {2*OOS_STEP_DAYS} giorni.",
             key="roc_steps",
         )
-        st.sidebar.caption(f"📅 Finestra ROC attiva: **{int(st.session_state['roc_steps']) * OOS_STEP_DAYS} giorni**")
+        st.sidebar.caption(f"\U0001f4c5 Finestra ROC attiva: **{int(st.session_state['roc_steps']) * OOS_STEP_DAYS} giorni**")
     st.sidebar.divider()
 
-    st.sidebar.subheader("🚫 Filtro ROC < 0")
+    st.sidebar.subheader("\U0001f6ab Filtro ROC < 0")
     st.sidebar.toggle(
         "Attiva filtro ROC < 0",
         help="Se attivo, esclude le strategie con Net PnL negativo sulla finestra configurata.",
@@ -406,7 +407,7 @@ if uploaded_file is not None:
             key="roc_filter_steps",
         )
         st.sidebar.caption(
-            f"📅 Finestra filtro ROC: **{int(st.session_state['roc_filter_steps']) * OOS_STEP_DAYS} giorni**"
+            f"\U0001f4c5 Finestra filtro ROC: **{int(st.session_state['roc_filter_steps']) * OOS_STEP_DAYS} giorni**"
         )
     st.sidebar.divider()
 
@@ -422,7 +423,7 @@ if uploaded_file is not None:
 
     st.sidebar.subheader("Gestione gruppi")
     new_group_name = st.sidebar.text_input("Nome nuovo gruppo", key="new_group_name")
-    if st.sidebar.button("➕ Crea gruppo"):
+    if st.sidebar.button("\u2795 Crea gruppo"):
         clean_name = new_group_name.strip()
         if clean_name:
             if clean_name not in st.session_state['group_names']:
@@ -431,7 +432,7 @@ if uploaded_file is not None:
                 st.sidebar.success(f"Gruppo '{clean_name}' creato")
                 st.rerun()
             else:
-                st.sidebar.warning("Gruppo già esistente")
+                st.sidebar.warning("Gruppo gi\u00e0 esistente")
         else:
             st.sidebar.warning("Inserisci un nome valido")
 
@@ -439,41 +440,41 @@ if uploaded_file is not None:
         group_to_rename = st.sidebar.selectbox("Gruppo da rinominare",
             options=st.session_state['group_names'], key="group_to_rename")
         renamed_group = st.sidebar.text_input("Nuovo nome", key="renamed_group")
-        if st.sidebar.button("✏️ Rinomina gruppo"):
+        if st.sidebar.button("\u270f\ufe0f Rinomina gruppo"):
             old_name, new_name = group_to_rename, renamed_group.strip()
             if not new_name:
                 st.sidebar.warning("Inserisci un nome valido")
             elif new_name in st.session_state['group_names'] and new_name != old_name:
-                st.sidebar.warning("Nome già esistente")
+                st.sidebar.warning("Nome gi\u00e0 esistente")
             else:
                 st.session_state['group_names'] = [new_name if g == old_name else g
                     for g in st.session_state['group_names']]
                 st.session_state['strategy_mapping'] = {
                     s: (new_name if g == old_name else g)
                     for s, g in st.session_state['strategy_mapping'].items()}
-                st.sidebar.success(f"'{old_name}' → '{new_name}'")
+                st.sidebar.success(f"'{old_name}' \u2192 '{new_name}'")
                 st.rerun()
     st.sidebar.divider()
 
     st.sidebar.subheader("Assegnazione strategie")
     group_options = [''] + st.session_state['group_names']
-    with st.sidebar.expander("📋 Modifica gruppo di ogni strategia", expanded=True):
+    with st.sidebar.expander("\U0001f4cb Modifica gruppo di ogni strategia", expanded=True):
         updated_mapping = {}
         for strat in all_strategies_in_file:
             cur = st.session_state['strategy_mapping'].get(strat, '')
             idx = group_options.index(cur) if cur in group_options else 0
             sel = st.selectbox(label=strat, options=group_options, index=idx, key=f"group_{strat}")
             updated_mapping[strat] = sel
-        if st.button("✅ Salva assegnazioni"):
+        if st.button("\u2705 Salva assegnazioni"):
             st.session_state['strategy_mapping'] = updated_mapping
-            st.sidebar.success("Assegnazioni aggiornate — esporta il JSON!")
+            st.sidebar.success("Assegnazioni aggiornate \u2014 esporta il JSON!")
             st.rerun()
 
     strategy_mapping = st.session_state['strategy_mapping']
     still_unmapped = [s for s in all_strategies_in_file if not strategy_mapping.get(s, '').strip()]
     if still_unmapped:
-        st.error(f"🛑 BLOCCO DI SICUREZZA: Strategie senza gruppo: {', '.join(still_unmapped)}")
-        st.info("Apri la sidebar (▶), assegna un gruppo a ogni strategia e salva.")
+        st.error(f"\U0001f6d1 BLOCCO DI SICUREZZA: Strategie senza gruppo: {', '.join(still_unmapped)}")
+        st.info("Apri la sidebar (\u25b6), assegna un gruppo a ogni strategia e salva.")
         st.stop()
 
     # Alias leggibili per il resto del codice
@@ -489,16 +490,16 @@ if uploaded_file is not None:
     bench_count      = top_n - full_weight_count
 
     # ─── TAB PRINCIPALI ───────────────────────────────────────────────────────
-    tab_wfa, tab_opt = st.tabs(["📊 Walk-Forward", "⚙️ Ottimizzatore"])
+    tab_wfa, tab_opt = st.tabs(["\U0001f4ca Walk-Forward", "\u2699\ufe0f Ottimizzatore"])
 
     with tab_wfa:
         st.markdown("---")
         col_launch, col_info = st.columns([3, 7])
         with col_launch:
-            launch = st.button("▶ Lancia simulazione WFA", type="primary", use_container_width=True)
+            launch = st.button("\u25b6 Lancia simulazione WFA", type="primary", use_container_width=True)
         with col_info:
             roc_filter_label = (
-                f" &nbsp;|&nbsp; 🚫 ROC filter: <b style='color:#ef4444'>"
+                f" &nbsp;|&nbsp; \U0001f6ab ROC filter: <b style='color:#ef4444'>"
                 f"{roc_filter_steps*OOS_STEP_DAYS}gg</b>"
             ) if roc_filter_enabled else ""
             ranking_label_color = "#f59e0b" if ranking_metric != "Omega Ratio" else "#00d4ff"
@@ -507,8 +508,8 @@ if uploaded_file is not None:
                 f"Ranking: <b style='color:{ranking_label_color}'>{ranking_metric}</b>"
                 + (f" ({roc_steps*OOS_STEP_DAYS}gg)" if ranking_metric=="ROC" else "")
                 + f" &nbsp;|&nbsp; Top-N: <b style='color:#00d4ff'>{top_n}</b>"
-                f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{full_weight_count}×{full_weight_pct}%</b>"
-                f" + <b style='color:#f59e0b'>{bench_count}×{bench_weight_pct}%</b>"
+                f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{full_weight_count}\u00d7{full_weight_pct}%</b>"
+                f" + <b style='color:#f59e0b'>{bench_count}\u00d7{bench_weight_pct}%</b>"
                 f" &nbsp;|&nbsp; Max/gr: <b style='color:#00d4ff'>{max_per_group}</b>"
                 + roc_filter_label + "</div>",
                 unsafe_allow_html=True
@@ -625,7 +626,10 @@ if uploaded_file is not None:
                         "roc_steps": _roc_s, "roc_filter_enabled": _roc_fe, "roc_filter_steps": _roc_fs,
                     }
                 }
-                st.success("✅ Elaborazione completata!")
+                # Invalida cache dettaglio finestre al cambio run
+                st.session_state.pop("wfa_detail_windows", None)
+                st.session_state.pop("wfa_detail_sig", None)
+                st.success("\u2705 Elaborazione completata!")
 
         if st.session_state.get("wfa_results") is not None:
             res           = st.session_state["wfa_results"]
@@ -642,13 +646,13 @@ if uploaded_file is not None:
             days_left    = (latest_end - today).days
 
             c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.info(f"📅 **Dal:** {latest_start.strftime('%d %b %Y')}")
-            c2.info(f"🔚 **Fino al:** {latest_end.strftime('%d %b %Y')}")
-            if days_left > 0: c3.warning(f"⏳ **Rotazione tra:** {days_left}gg")
-            else:             c3.error("🔄 **Rotazione scaduta**")
-            c4.info(f"🏆 **Ranking:** {run_params['ranking_metric']}")
-            c5.info(f"🎛️ Top-N: **{run_params['top_n']}** | Max/gr: **{run_params['max_per_group']}**")
-            c6.info(f"⚖️ **{run_params['full_weight_count']}×{run_params['full_weight_pct']}%** + **{run_params['top_n']-run_params['full_weight_count']}×{run_params['bench_weight_pct']}%**")
+            c1.info(f"\U0001f4c5 **Dal:** {latest_start.strftime('%d %b %Y')}")
+            c2.info(f"\U0001f51a **Fino al:** {latest_end.strftime('%d %b %Y')}")
+            if days_left > 0: c3.warning(f"\u23f3 **Rotazione tra:** {days_left}gg")
+            else:             c3.error("\U0001f504 **Rotazione scaduta**")
+            c4.info(f"\U0001f3c6 **Ranking:** {run_params['ranking_metric']}")
+            c5.info(f"\U0001f3db\ufe0f Top-N: **{run_params['top_n']}** | Max/gr: **{run_params['max_per_group']}**")
+            c6.info(f"\u2696\ufe0f **{run_params['full_weight_count']}\u00d7{run_params['full_weight_pct']}%** + **{run_params['top_n']-run_params['full_weight_count']}\u00d7{run_params['bench_weight_pct']}%**")
 
             latest_alloc = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start].copy()
             disp = latest_alloc[['Rank','Strategy','Group','Score IS','Metric','Weight','Banned Days']].copy()
@@ -666,18 +670,18 @@ if uploaded_file is not None:
                 latest_roc_excl = roc_filter_df[roc_filter_df['OOS Start'] == latest_start]
                 if not latest_roc_excl.empty: _show_logs.append(("ROC filter", latest_roc_excl))
             for log_label, log_df in _show_logs:
-                st.warning(f"⚠️ Strategie escluse ({log_label}):")
+                st.warning(f"\u26a0\ufe0f Strategie escluse ({log_label}):")
                 st.dataframe(log_df[['Strategy','Motivo']], use_container_width=True, hide_index=True)
 
             st.header("2. Metriche Out-Of-Sample")
-            tab_global, tab_recent = st.tabs(["📊 Storico Completo OOS", "📈 Dal 1° Settembre 2025"])
+            tab_global, tab_recent = st.tabs(["\U0001f4ca Storico Completo OOS", "\U0001f4c8 Dal 1\u00b0 Settembre 2025"])
             with tab_global:
-                render_metrics(calculate_metrics(final_oos_df), "Metriche — Storico Completo OOS")
+                render_metrics(calculate_metrics(final_oos_df), "Metriche \u2014 Storico Completo OOS")
             with tab_recent:
                 recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
-                render_metrics(calculate_metrics(recent_df), "Metriche — Dal 1° Settembre 2025")
+                render_metrics(calculate_metrics(recent_df), "Metriche \u2014 Dal 1\u00b0 Settembre 2025")
 
-            st.header("3. Curva Equity — Storico Completo OOS")
+            st.header("3. Curva Equity \u2014 Storico Completo OOS")
             all_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
             all_cum   = all_daily.cumsum()
             fig_all = go.Figure()
@@ -685,11 +689,11 @@ if uploaded_file is not None:
                 x=all_cum.index, y=all_cum.values, mode='lines', fill='tozeroy',
                 line=dict(color='#00d4ff', width=2), fillcolor='rgba(0,212,255,0.08)'
             ))
-            fig_all.update_layout(title="Equity Cumulativa WFA — Storico Completo",
+            fig_all.update_layout(title="Equity Cumulativa WFA \u2014 Storico Completo",
                 xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
             st.plotly_chart(fig_all, use_container_width=True)
 
-            st.header("4. Curva Equity — Dal 1° Settembre 2025")
+            st.header("4. Curva Equity \u2014 Dal 1\u00b0 Settembre 2025")
             recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
             if not recent_df.empty:
                 rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
@@ -699,11 +703,11 @@ if uploaded_file is not None:
                     x=rec_cum.index, y=rec_cum.values, mode='lines', fill='tozeroy',
                     line=dict(color='#f59e0b', width=2), fillcolor='rgba(245,158,11,0.08)'
                 ))
-                fig_rec.update_layout(title="Equity Cumulativa WFA — Dal 1° Settembre 2025",
+                fig_rec.update_layout(title="Equity Cumulativa WFA \u2014 Dal 1\u00b0 Settembre 2025",
                     xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
                 st.plotly_chart(fig_rec, use_container_width=True)
             else:
-                st.info("Nessun dato OOS disponibile dal 1° settembre 2025.")
+                st.info("Nessun dato OOS disponibile dal 1\u00b0 settembre 2025.")
 
             st.header("5. Esporta Dati")
             hist_export = hist_alloc_df.copy()
@@ -714,27 +718,225 @@ if uploaded_file is not None:
 
             col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
             with col_b1:
-                st.download_button("📥 Allocazioni Storiche",
+                st.download_button("\U0001f4e5 Allocazioni Storiche",
                     data=hist_export.to_csv(index=False).encode('utf-8'), file_name="wfa_allocations.csv", mime="text/csv")
             with col_b2:
-                st.download_button("📥 Trade OOS Filtrati",
+                st.download_button("\U0001f4e5 Trade OOS Filtrati",
                     data=final_oos_df.to_csv(index=False).encode('utf-8'), file_name="wfa_oos_trades.csv", mime="text/csv")
             with col_b3:
-                st.download_button("📥 Equity Line Completa",
+                st.download_button("\U0001f4e5 Equity Line Completa",
                     data=equity_csv_df.to_csv(index=False).encode('utf-8'), file_name="equity_full.csv", mime="text/csv")
             with col_b4:
                 if not recent_df.empty:
                     rec_equity_csv = pd.DataFrame({
                         'Date': rec_cum.index, 'Daily PnL': rec_daily.values, 'Cumulative PnL': rec_cum.values})
-                    st.download_button("📥 Equity Line Set 2025+",
+                    st.download_button("\U0001f4e5 Equity Line Set 2025+",
                         data=rec_equity_csv.to_csv(index=False).encode('utf-8'), file_name="equity_sep2025.csv", mime="text/csv")
             with col_b5:
                 combined_excl = pd.concat([exclusions_df, roc_filter_df]).reset_index(drop=True) \
                     if not roc_filter_df.empty else exclusions_df
                 if not combined_excl.empty:
                     combined_excl['OOS Start'] = combined_excl['OOS Start'].astype(str)
-                    st.download_button("📥 Log Esclusioni",
+                    st.download_button("\U0001f4e5 Log Esclusioni",
                         data=combined_excl.to_csv(index=False).encode('utf-8'), file_name="wfa_exclusions.csv", mime="text/csv")
+
+            # ─── SEZIONE 6: DETTAGLIO COMBINAZIONE WFA ────────────────────────
+            st.header("6. Dettaglio Combinazione WFA")
+            st.caption(
+                "Analisi per singola finestra OOS dei parametri attualmente in uso: "
+                "distribuzione del Profit Factor, PnL finestra per finestra e frequenza delle strategie selezionate."
+            )
+
+            _wfa_params_detail = WFAParams(
+                top_n=run_params["top_n"],
+                full_weight_count=run_params["full_weight_count"],
+                full_weight_pct=float(run_params["full_weight_pct"]),
+                bench_weight_pct=float(run_params["bench_weight_pct"]),
+                max_per_group=run_params["max_per_group"],
+                ranking_metric=run_params["ranking_metric"],
+                roc_filter_enabled=run_params["roc_filter_enabled"],
+                roc_filter_steps=run_params["roc_filter_steps"],
+            )
+
+            _detail_cache_key = "wfa_detail_windows"
+            _detail_sig_key   = "wfa_detail_sig"
+            _current_sig = (
+                run_params["top_n"], run_params["full_weight_count"],
+                run_params["full_weight_pct"], run_params["bench_weight_pct"],
+                run_params["max_per_group"], run_params["ranking_metric"],
+                run_params["roc_filter_enabled"], run_params["roc_filter_steps"],
+            )
+
+            if (
+                _detail_cache_key not in st.session_state
+                or st.session_state.get(_detail_sig_key) != _current_sig
+            ):
+                with st.spinner("Calcolo finestre OOS per il dettaglio..."):
+                    _df_for_detail = df_raw.copy()
+                    _df_for_detail["Date Opened"] = pd.to_datetime(_df_for_detail["Date Opened"])
+                    _df_for_detail["Date Closed"] = pd.to_datetime(_df_for_detail["Date Closed"])
+                    _df_for_detail["weekday_open"] = _df_for_detail["Date Opened"].dt.weekday
+                    _df_for_detail["P/L"] = _df_for_detail["P/L"].apply(clean_money)
+                    _df_for_detail["Opening Commissions + Fees"] = _df_for_detail["Opening Commissions + Fees"].fillna(0).apply(clean_money)
+                    _df_for_detail["Closing Commissions + Fees"] = _df_for_detail["Closing Commissions + Fees"].fillna(0).apply(clean_money)
+                    _df_for_detail["Net PnL"] = (
+                        _df_for_detail["P/L"]
+                        - _df_for_detail["Opening Commissions + Fees"]
+                        - _df_for_detail["Closing Commissions + Fees"]
+                    )
+                    _df_for_detail = _df_for_detail.sort_values("Date Closed").reset_index(drop=True)
+
+                    _windows_detail = run_wfa_single_windowed(
+                        df=_df_for_detail,
+                        params=_wfa_params_detail,
+                        group_map=strategy_mapping,
+                        date_col="Date Closed",
+                        strategy_col="Strategy",
+                        pnl_col="Net PnL",
+                    )
+                st.session_state[_detail_cache_key] = _windows_detail
+                st.session_state[_detail_sig_key]   = _current_sig
+            else:
+                _windows_detail = st.session_state[_detail_cache_key]
+
+            if not _windows_detail:
+                st.warning("Nessuna finestra OOS disponibile per il dettaglio.")
+            else:
+                _n_win = len(_windows_detail)
+
+                # ── Box Plot PF per finestra OOS ──────────────────────────────
+                st.markdown("#### \U0001f3af Box Plot PF per finestra OOS")
+                _pf_vals = [w["pf"] for w in _windows_detail]
+                _rng = np.random.default_rng(42)
+                _jitter_x     = _rng.uniform(-0.25, 0.25, size=len(_pf_vals)).tolist()
+                _point_colors = ["#6ee7b7" if v >= 1.0 else "#f87171" for v in _pf_vals]
+                _hover_texts  = [f"Finestra {i+1}<br>PF: {v:.2f}" for i, v in enumerate(_pf_vals)]
+
+                fig_wfa_box = go.Figure()
+                fig_wfa_box.add_trace(go.Box(
+                    y=_pf_vals, x=[0] * len(_pf_vals),
+                    name="PF per finestra",
+                    marker_color="#4f98a3", line_color="#4f98a3",
+                    fillcolor="rgba(79,152,163,0.25)",
+                    boxpoints=False, showlegend=False, hoverinfo="skip",
+                ))
+                fig_wfa_box.add_trace(go.Scatter(
+                    x=_jitter_x, y=_pf_vals, mode="markers",
+                    marker=dict(size=8, color=_point_colors,
+                                line=dict(color="#0d1117", width=1), opacity=0.9),
+                    text=_hover_texts,
+                    hovertemplate="%{text}<extra></extra>",
+                    showlegend=False, name="Punti",
+                ))
+                fig_wfa_box.add_hline(
+                    y=1.0, line_dash="dash", line_color="#ef4444", line_width=1.5,
+                    annotation_text="PF = 1.0",
+                    annotation_position="bottom right",
+                    annotation_font=dict(color="#ef4444", size=10),
+                )
+                fig_wfa_box.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#131920",
+                    font=dict(color="#e0eaf4"),
+                    xaxis=dict(showticklabels=False, zeroline=False, showgrid=False, range=[-1, 1]),
+                    yaxis=dict(title="Profit Factor", gridcolor="#1e2a35"),
+                    height=360, margin=dict(l=60, r=40, t=40, b=40), showlegend=False,
+                    title=dict(
+                        text=f"Distribuzione PF \u2014 {_n_win} finestre OOS",
+                        font=dict(size=13, color="#e0eaf4"), x=0.02,
+                    ),
+                )
+                st.plotly_chart(fig_wfa_box, use_container_width=True)
+
+                # ── PnL per finestra OOS ──────────────────────────────────────
+                st.markdown("#### \U0001f4c5 PnL per finestra OOS")
+                st.caption("Verde = finestra profittevole \u00b7 Rosso = finestra in perdita \u00b7 Linea tratteggiata = break-even.")
+
+                _win_labels = [f"W{w['window']}\n{w['start_oos'][:7]}" for w in _windows_detail]
+                _win_pnl    = [w["total_pnl"] for w in _windows_detail]
+                _win_pf     = [w["pf"] for w in _windows_detail]
+                _win_start  = [w["start_oos"] for w in _windows_detail]
+                _win_end    = [w["end_oos"] for w in _windows_detail]
+                _bar_colors = ["#6ee7b7" if v > 0 else "#f87171" for v in _win_pnl]
+
+                fig_wfa_pnl = go.Figure()
+                fig_wfa_pnl.add_trace(go.Bar(
+                    x=_win_labels, y=_win_pnl,
+                    marker_color=_bar_colors,
+                    marker_line=dict(color="#0d1117", width=0.8),
+                    customdata=list(zip(_win_start, _win_end, _win_pf)),
+                    hovertemplate=(
+                        "<b>Finestra %{x}</b><br>"
+                        "Dal %{customdata[0]} al %{customdata[1]}<br>"
+                        "<b>PnL:</b> $%{y:,.2f}<br>"
+                        "<b>PF:</b> %{customdata[2]:.2f}<br>"
+                        "<extra></extra>"
+                    ),
+                    showlegend=False,
+                ))
+                fig_wfa_pnl.add_hline(y=0, line_dash="dash", line_color="#9ca3af", line_width=1.2)
+                fig_wfa_pnl.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#131920",
+                    font=dict(color="#e0eaf4"),
+                    xaxis=dict(title="Finestra OOS", gridcolor="#1e2a35",
+                               tickangle=-45 if len(_win_labels) > 8 else 0),
+                    yaxis=dict(title="Total PnL ($)", gridcolor="#1e2a35",
+                               tickprefix="$", separatethousands=True, zeroline=False),
+                    height=320, margin=dict(l=70, r=40, t=30, b=60), bargap=0.25,
+                )
+                st.plotly_chart(fig_wfa_pnl, use_container_width=True)
+
+                # ── Frequenza strategie nelle finestre OOS ────────────────────
+                _all_selected = []
+                for _w in _windows_detail:
+                    _all_selected.extend(_w.get("selected_strategies", []))
+
+                if _all_selected:
+                    st.markdown("#### \U0001f9e9 Frequenza strategie nelle finestre OOS")
+                    st.caption(
+                        "Quante finestre OOS ha coperto ogni strategia selezionata in IS. "
+                        "Barre pi\u00f9 chiare = presente in meno del 50% delle finestre."
+                    )
+                    _freq         = Counter(_all_selected)
+                    _strat_names  = [s for s, _ in _freq.most_common()]
+                    _strat_counts = [_freq[s] for s in _strat_names]
+                    _strat_pcts   = [_freq[s] / _n_win * 100 for s in _strat_names]
+                    _bar_colors_s = [
+                        "#4f98a3" if (_freq[s] / _n_win) >= 0.5 else "#2a5560"
+                        for s in _strat_names
+                    ]
+
+                    fig_wfa_freq = go.Figure()
+                    fig_wfa_freq.add_trace(go.Bar(
+                        x=_strat_counts, y=_strat_names, orientation="h",
+                        marker_color=_bar_colors_s,
+                        marker_line=dict(color="#0d1117", width=0.6),
+                        text=[f"{p:.0f}%" for p in _strat_pcts],
+                        textposition="outside",
+                        textfont=dict(color="#e0eaf4", size=11),
+                        customdata=_strat_pcts,
+                        hovertemplate=(
+                            "<b>%{y}</b><br>"
+                            "Presente in <b>%{x}</b> finestre su " + str(_n_win) + "<br>"
+                            "Frequenza: <b>%{customdata:.1f}%</b><br>"
+                            "<extra></extra>"
+                        ),
+                        showlegend=False,
+                    ))
+                    fig_wfa_freq.update_layout(
+                        template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#131920",
+                        font=dict(color="#e0eaf4"),
+                        xaxis=dict(title="N\u00b0 finestre OOS", gridcolor="#1e2a35",
+                                   range=[0, _n_win * 1.18], zeroline=False),
+                        yaxis=dict(title="", gridcolor="#1e2a35", automargin=True),
+                        height=max(260, len(_strat_names) * 28 + 80),
+                        margin=dict(l=20, r=80, t=30, b=50), bargap=0.3,
+                    )
+                    st.plotly_chart(fig_wfa_freq, use_container_width=True)
+                else:
+                    st.caption(
+                        "\u2139\ufe0f Dati `selected_strategies` non disponibili per questa run. "
+                        "Riesegui la simulazione WFA per visualizzare il grafico."
+                    )
 
     # ─── TAB OTTIMIZZATORE ────────────────────────────────────────────────────
     with tab_opt:
