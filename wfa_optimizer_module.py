@@ -1,7 +1,19 @@
 # ================================================================
 #  MODULO OTTIMIZZATORE WFA — WFA-Turbo-Pro
 #  File: wfa_optimizer_module.py
-#  Versione: 2.0.0 — 2026-05-06
+#  Versione: 2.0.1 — 2026-05-07
+#  Changelog v2.0.1:
+#    - Fix: UI robustezza duplicata al rerun di Streamlit.
+#      La progress bar veniva mantenuta visibile dopo il calcolo
+#      perché mancava prog.empty() al termine del loop.
+#      La cache di robustezza ora usa una firma completa delle
+#      top20 (Rank, parametri WFA) invece del solo len(top20),
+#      così il ricalcolo viene triggerato correttamente quando
+#      cambiano i risultati dell'ottimizzazione.
+#      Chiave cache rinominata da wfa_robustness_n_rows a
+#      wfa_robustness_top20_signature. Tutte le invalidazioni
+#      (import JSON, run nuova) aggiornate di conseguenza.
+#
 #  Changelog v2.0.0:
 #    - run_wfa_single_windowed: aggiunto campo "selected_strategies"
 #      (List[str]) al dict di ogni finestra OOS — contiene le chiavi
@@ -648,10 +660,24 @@ def render_robustness_section(
 
     cache_key = "wfa_robustness_cache"
     top20 = df_res.head(20).copy()
+    top20_signature = tuple(
+        (
+            int(row["Rank"]),
+            int(row["top_n"]),
+            int(row["full_weight_count"]),
+            float(row["full_weight_pct"]),
+            float(row["bench_weight_pct"]),
+            int(row["max_per_group"]),
+            str(row["ranking_metric"]),
+            bool(row["roc_filter"]),
+            int(row["roc_steps"]),
+        )
+        for _, row in top20.iterrows()
+    )
 
     need_recompute = (
         cache_key not in st.session_state
-        or st.session_state.get("wfa_robustness_n_rows", 0) != len(top20)
+        or st.session_state.get("wfa_robustness_top20_signature") != top20_signature
     )
 
     if need_recompute:
@@ -677,8 +703,9 @@ def render_robustness_section(
             profiles.append(compute_robustness_profile(windows, dd_threshold=dd_thresh_val))
 
         prog.progress(1.0, text="✅ Analisi robustezza completata")
+        prog.empty()
         st.session_state[cache_key] = profiles
-        st.session_state["wfa_robustness_n_rows"] = len(top20)
+        st.session_state["wfa_robustness_top20_signature"] = top20_signature
     else:
         profiles = st.session_state[cache_key]
 
@@ -1109,7 +1136,7 @@ def render_optimizer_tab(
                 st.session_state["wfa_opt_results"] = df_imp
                 st.session_state["wfa_opt_target"]  = metric_imp
                 st.session_state.pop("wfa_robustness_cache", None)
-                st.session_state.pop("wfa_robustness_n_rows", None)
+                st.session_state.pop("wfa_robustness_top20_signature", None)
                 payload_meta = json.loads(raw_bytes.decode())
                 st.success(
                     f"✅ Run importata: **{len(df_imp)}** combinazioni · "
@@ -1244,6 +1271,7 @@ def render_optimizer_tab(
         st.session_state["wfa_opt_results"] = df_res
         st.session_state["wfa_opt_target"]  = target_metric
         st.session_state.pop("wfa_robustness_cache", None)
+        st.session_state.pop("wfa_robustness_top20_signature", None)
 
     if "wfa_opt_results" not in st.session_state:
         return
