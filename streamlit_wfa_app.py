@@ -19,10 +19,17 @@ from wfa_core import (
     DEFAULT_ROC_STEPS,
     DEFAULT_ROC_FILTER_ENABLED,
     DEFAULT_ROC_FILTER_STEPS,
+    DEFAULT_EC_ENABLED,
+    DEFAULT_EC_CAPITAL_MODE,
+    DEFAULT_EC_P80,
+    DEFAULT_EC_P90,
+    DEFAULT_EC_P95,
     compute_ranking_score,
     passes_roc_filter,
     compute_cusum_banned,
     format_banned_days,
+    compute_dd_percentiles_from_is,
+    apply_equity_control,
 )
 from wfa_optimizer_module import render_optimizer_tab, run_wfa_single_windowed, WFAParams
 
@@ -128,6 +135,10 @@ configurabile (multipli di OOS step) è negativo. Utile per bloccare strategie i
 
 **7. OOS filtrato** — Trade filtrati da blacklist CUSUM e ponderati.
 
+**8. Equity Control (opzionale)** — Modulation del rischio per strategia basata sui percentili del DD IS.
+Schema a 4 livelli: DD < P80 → size piena; P80–P90 → 50%; P90–P95 → 25%; DD >= P95 → stop totale.
+Modalità Trailing (equity cumulativa tra finestre) o Fisso (reset a ogni finestra OOS).
+
 ---
 
 ### 💾 Backup configurazione
@@ -171,9 +182,9 @@ def clean_money(val):
     if isinstance(val, (int, float)): return val
     return float(str(val).replace('$', '').replace(',', ''))
 
-def calculate_metrics(df):
+def calculate_metrics(df, pnl_col='Weighted Net PnL'):
     if df.empty: return {}
-    pnl = df['Weighted Net PnL']
+    pnl = df[pnl_col]
     total_pnl  = pnl.sum()
     total_trades = len(pnl)
     wins, losses = pnl[pnl > 0], pnl[pnl < 0]
@@ -182,7 +193,7 @@ def calculate_metrics(df):
     avg_loss = losses.mean() if len(losses) > 0 else 0
     profit_factor = wins.sum() / abs(losses.sum()) if len(losses) > 0 and losses.sum() != 0 else np.inf
     expectancy    = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
-    daily_pnl = df.groupby(df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+    daily_pnl = df.groupby(df['Date Closed'].dt.date)[pnl_col].sum()
     cum_pnl   = daily_pnl.cumsum()
     max_dd    = (cum_pnl.cummax() - cum_pnl).max()
     mean_d, std_d = daily_pnl.mean(), daily_pnl.std()
@@ -228,7 +239,7 @@ def render_metrics(m, label):
 # ─── FUNZIONI JSON CONFIG ─────────────────────────────────────────────────────
 def build_config_payload():
     return {
-        "version": 3,
+        "version": 4,
         "group_names":          st.session_state.get("group_names", []),
         "strategy_mapping":     st.session_state.get("strategy_mapping", {}),
         "max_per_group":        int(st.session_state.get("max_per_group",        DEFAULT_MAX_PER_GROUP)),
@@ -240,6 +251,11 @@ def build_config_payload():
         "roc_steps":            int(st.session_state.get("roc_steps",            DEFAULT_ROC_STEPS)),
         "roc_filter_enabled":   bool(st.session_state.get("roc_filter_enabled",  DEFAULT_ROC_FILTER_ENABLED)),
         "roc_filter_steps":     int(st.session_state.get("roc_filter_steps",     DEFAULT_ROC_FILTER_STEPS)),
+        "ec_enabled":           bool(st.session_state.get("ec_enabled",          DEFAULT_EC_ENABLED)),
+        "ec_capital_mode":      st.session_state.get("ec_capital_mode",          DEFAULT_EC_CAPITAL_MODE),
+        "ec_p80":               int(st.session_state.get("ec_p80",               DEFAULT_EC_P80)),
+        "ec_p90":               int(st.session_state.get("ec_p90",               DEFAULT_EC_P90)),
+        "ec_p95":               int(st.session_state.get("ec_p95",               DEFAULT_EC_P95)),
     }
 
 def apply_config_payload(payload, all_strategies):
@@ -266,6 +282,13 @@ def apply_config_payload(payload, all_strategies):
     st.session_state["roc_steps"]         = max(1, int(payload.get("roc_steps",         DEFAULT_ROC_STEPS)))
     st.session_state["roc_filter_enabled"]= bool(payload.get("roc_filter_enabled",       DEFAULT_ROC_FILTER_ENABLED))
     st.session_state["roc_filter_steps"]  = max(1, int(payload.get("roc_filter_steps",   DEFAULT_ROC_FILTER_STEPS)))
+    # EC fields
+    st.session_state["ec_enabled"]        = bool(payload.get("ec_enabled",       DEFAULT_EC_ENABLED))
+    ec_mode = payload.get("ec_capital_mode", DEFAULT_EC_CAPITAL_MODE)
+    st.session_state["ec_capital_mode"]   = ec_mode if ec_mode in ("Trailing", "Fisso") else DEFAULT_EC_CAPITAL_MODE
+    st.session_state["ec_p80"]            = max(1, min(99, int(payload.get("ec_p80", DEFAULT_EC_P80))))
+    st.session_state["ec_p90"]            = max(1, min(99, int(payload.get("ec_p90", DEFAULT_EC_P90))))
+    st.session_state["ec_p95"]            = max(1, min(99, int(payload.get("ec_p95", DEFAULT_EC_P95))))
 
 # ─── INIT SESSION STATE ───────────────────────────────────────────────────────
 _SS_DEFAULTS = {
@@ -278,6 +301,12 @@ _SS_DEFAULTS = {
     "roc_filter_enabled": DEFAULT_ROC_FILTER_ENABLED,
     "roc_filter_steps":   DEFAULT_ROC_FILTER_STEPS,
     "max_per_group":      DEFAULT_MAX_PER_GROUP,
+    # EC defaults
+    "ec_enabled":         DEFAULT_EC_ENABLED,
+    "ec_capital_mode":    DEFAULT_EC_CAPITAL_MODE,
+    "ec_p80":             DEFAULT_EC_P80,
+    "ec_p90":             DEFAULT_EC_P90,
+    "ec_p95":             DEFAULT_EC_P95,
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -336,7 +365,7 @@ if uploaded_file is not None:
 
     st.sidebar.divider()
 
-    # ── Parametri WFA — FIX: key= nativo, nessuna scrittura manuale su session_state ──
+    # ── Parametri WFA ──────────────────────────────────────────────────────────
     st.sidebar.subheader("\U0001f3db\ufe0f Parametri WFA")
 
     st.sidebar.number_input(
@@ -408,6 +437,60 @@ if uploaded_file is not None:
         )
         st.sidebar.caption(
             f"\U0001f4c5 Finestra filtro ROC: **{int(st.session_state['roc_filter_steps']) * OOS_STEP_DAYS} giorni**"
+        )
+    st.sidebar.divider()
+
+    # ── EQUITY CONTROL ────────────────────────────────────────────────────────
+    st.sidebar.subheader("\U0001f4c9 Equity Control")
+    st.sidebar.toggle(
+        "Attiva Equity Control",
+        help=(
+            "Modula il rischio per strategia in base al drawdown OOS corrente "
+            "rispetto ai percentili calcolati sulla finestra IS. "
+            "Schema: DD<P80=100%, P80-P90=50%, P90-P95=25%, DD>=P95=0%."
+        ),
+        key="ec_enabled",
+    )
+
+    if st.session_state["ec_enabled"]:
+        ec_mode_options = ["Trailing", "Fisso"]
+        ec_mode_idx = ec_mode_options.index(st.session_state["ec_capital_mode"]) \
+            if st.session_state["ec_capital_mode"] in ec_mode_options else 0
+        st.sidebar.selectbox(
+            "Modalita capitale",
+            options=ec_mode_options,
+            index=ec_mode_idx,
+            help=(
+                "Trailing: equity cumulativa tra finestre OOS; "
+                "il DD e misurato sul massimo storico assoluto. "
+                "Fisso: ogni finestra OOS riparte da equity=0; "
+                "il DD e misurato solo all interno della finestra."
+            ),
+            key="ec_capital_mode",
+        )
+        st.sidebar.number_input(
+            "Percentile DD soglia P80 (half size)",
+            min_value=50, max_value=95, step=5,
+            help="Sotto questa soglia DD: RiskFactor=1.0 (piena size).",
+            key="ec_p80",
+        )
+        st.sidebar.number_input(
+            "Percentile DD soglia P90 (quarter size)",
+            min_value=int(st.session_state["ec_p80"]) + 1, max_value=98, step=1,
+            help="Tra P80 e P90: RiskFactor=0.5.",
+            key="ec_p90",
+        )
+        st.sidebar.number_input(
+            "Percentile DD soglia P95 (stop totale)",
+            min_value=int(st.session_state["ec_p90"]) + 1, max_value=99, step=1,
+            help="Tra P90 e P95: RiskFactor=0.25. Oltre P95: RiskFactor=0.0.",
+            key="ec_p95",
+        )
+        st.sidebar.caption(
+            f"**Schema attivo:** DD<P{int(st.session_state['ec_p80'])}=100% "
+            f"| P{int(st.session_state['ec_p80'])}-P{int(st.session_state['ec_p90'])}=50% "
+            f"| P{int(st.session_state['ec_p90'])}-P{int(st.session_state['ec_p95'])}=25% "
+            f"| DD>=P{int(st.session_state['ec_p95'])}=0%"
         )
     st.sidebar.divider()
 
@@ -488,6 +571,12 @@ if uploaded_file is not None:
     roc_filter_enabled = bool(st.session_state["roc_filter_enabled"])
     roc_filter_steps = int(st.session_state["roc_filter_steps"])
     bench_count      = top_n - full_weight_count
+    # EC aliases
+    ec_enabled       = bool(st.session_state["ec_enabled"])
+    ec_capital_mode  = st.session_state["ec_capital_mode"]
+    ec_p80           = int(st.session_state["ec_p80"])
+    ec_p90           = int(st.session_state["ec_p90"])
+    ec_p95           = int(st.session_state["ec_p95"])
 
     # ─── TAB PRINCIPALI ───────────────────────────────────────────────────────
     tab_wfa, tab_opt = st.tabs(["\U0001f4ca Walk-Forward", "\u2699\ufe0f Ottimizzatore"])
@@ -502,6 +591,9 @@ if uploaded_file is not None:
                 f" &nbsp;|&nbsp; \U0001f6ab ROC filter: <b style='color:#ef4444'>"
                 f"{roc_filter_steps*OOS_STEP_DAYS}gg</b>"
             ) if roc_filter_enabled else ""
+            ec_label = (
+                f" &nbsp;|&nbsp; \U0001f4c9 EC: <b style='color:#22c55e'>{ec_capital_mode}</b>"
+            ) if ec_enabled else ""
             ranking_label_color = "#f59e0b" if ranking_metric != "Omega Ratio" else "#00d4ff"
             st.markdown(
                 f"<div style='padding-top:10px; color:#7a9abf; font-size:0.88rem;'>"
@@ -511,7 +603,7 @@ if uploaded_file is not None:
                 f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{full_weight_count}\u00d7{full_weight_pct}%</b>"
                 f" + <b style='color:#f59e0b'>{bench_count}\u00d7{bench_weight_pct}%</b>"
                 f" &nbsp;|&nbsp; Max/gr: <b style='color:#00d4ff'>{max_per_group}</b>"
-                + roc_filter_label + "</div>",
+                + roc_filter_label + ec_label + "</div>",
                 unsafe_allow_html=True
             )
 
@@ -526,6 +618,11 @@ if uploaded_file is not None:
             _roc_s    = roc_steps
             _roc_fe   = roc_filter_enabled
             _roc_fs   = roc_filter_steps
+            _ec_en    = ec_enabled
+            _ec_mode  = ec_capital_mode
+            _ec_p80   = ec_p80
+            _ec_p90   = ec_p90
+            _ec_p95   = ec_p95
 
             with st.spinner("Elaborazione Walk-Forward in corso..."):
                 df_filtered = df_raw.copy()
@@ -547,6 +644,10 @@ if uploaded_file is not None:
                 max_date  = df_filtered['Date Closed'].max()
                 current_oos_start = min_date + pd.DateOffset(months=12)
                 oos_results, historical_allocations, cusum_exclusions_log, roc_filter_log = [], [], [], []
+                ec_warnings_log = []
+
+                # EC: dizionario trailing equity per strategia (usato solo in modalita Trailing)
+                ec_trailing_equity: dict = {}
 
                 while current_oos_start <= max_date:
                     current_oos_end  = current_oos_start + pd.Timedelta(days=OOS_STEP_DAYS)
@@ -578,9 +679,23 @@ if uploaded_file is not None:
                             cusum_exclusions_log.append({'OOS Start': current_oos_start, 'Strategy': strat,
                                 'Motivo': f"Tutti i giorni bannati: {format_banned_days(banned_days)}"})
                             continue
+
+                        # EC: calcola soglie DD dalla finestra IS
+                        ec_thresholds = None
+                        if _ec_en:
+                            ec_info = compute_dd_percentiles_from_is(strat_is, _ec_p80, _ec_p90, _ec_p95)
+                            ec_thresholds = ec_info
+                            if ec_info.get("warning"):
+                                ec_warnings_log.append({
+                                    'OOS Start': current_oos_start,
+                                    'Strategy': strat,
+                                    'Warning': ec_info["warning"],
+                                })
+
                         is_metrics.append({'Strategy': strat, 'Group': _sm[strat],
                             'Score': score, 'Higher_is_better': higher_is_better,
-                            'Net PnL IS': strat_is['Net PnL'].sum(), 'Banned Days': banned_days})
+                            'Net PnL IS': strat_is['Net PnL'].sum(), 'Banned Days': banned_days,
+                            'EC Thresholds': ec_thresholds})
 
                     is_metrics_df = pd.DataFrame(is_metrics)
                     if not is_metrics_df.empty:
@@ -603,30 +718,58 @@ if uploaded_file is not None:
                                 'Score IS': round(strat_row['Score'], 4), 'Metric': _metric,
                                 'Weight': weight, 'Banned Days': banned,
                                 'Top-N': _top_n, 'Max Per Group': _mpg,
+                                'EC P80': strat_row['EC Thresholds']['dd_p80'] if _ec_en and strat_row['EC Thresholds'] else None,
+                                'EC P90': strat_row['EC Thresholds']['dd_p90'] if _ec_en and strat_row['EC Thresholds'] else None,
+                                'EC P95': strat_row['EC Thresholds']['dd_p95'] if _ec_en and strat_row['EC Thresholds'] else None,
                             })
                             strat_oos = oos_data[oos_data['Strategy'] == strat_name].copy()
                             if not strat_oos.empty:
                                 strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned)]
                                 strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
+
+                                # EC: applica modulation
+                                if _ec_en and strat_row['EC Thresholds'] is not None:
+                                    start_eq = ec_trailing_equity.get(strat_name, 0.0) if _ec_mode == "Trailing" else 0.0
+                                    strat_oos = apply_equity_control(
+                                        strat_oos,
+                                        thresholds=strat_row['EC Thresholds'],
+                                        capital_mode=_ec_mode,
+                                        start_equity=start_eq,
+                                    )
+                                    # Aggiorna trailing equity
+                                    if _ec_mode == "Trailing":
+                                        ec_trailing_equity[strat_name] = (
+                                            start_eq + strat_oos['EC Weighted Net PnL'].sum()
+                                        )
+
                                 oos_results.append(strat_oos)
                     current_oos_start = current_oos_end
 
             if not oos_results:
                 st.error("Nessun trade OOS generato. Il dataset deve coprire almeno 13 mesi di storia.")
             else:
+                final_oos_df = pd.concat(oos_results).sort_values('Date Closed').reset_index(drop=True)
+
+                # Colonna PnL attiva: EC se attivo, altrimenti Weighted Net PnL standard
+                _pnl_col = 'EC Weighted Net PnL' if (_ec_en and 'EC Weighted Net PnL' in final_oos_df.columns) else 'Weighted Net PnL'
+
                 st.session_state["wfa_results"] = {
-                    "final_oos_df":   pd.concat(oos_results).sort_values('Date Closed').reset_index(drop=True),
+                    "final_oos_df":   final_oos_df,
                     "hist_alloc_df":  pd.DataFrame(historical_allocations),
                     "exclusions_df":  pd.DataFrame(cusum_exclusions_log),
                     "roc_filter_df":  pd.DataFrame(roc_filter_log),
+                    "ec_warnings_df": pd.DataFrame(ec_warnings_log),
+                    "ec_enabled":     _ec_en,
+                    "pnl_col":        _pnl_col,
                     "params": {
                         "top_n": _top_n, "full_weight_count": _fwc,
                         "full_weight_pct": int(_fwp*100), "bench_weight_pct": int(_bwp*100),
                         "max_per_group": _mpg, "ranking_metric": _metric,
                         "roc_steps": _roc_s, "roc_filter_enabled": _roc_fe, "roc_filter_steps": _roc_fs,
+                        "ec_enabled": _ec_en, "ec_capital_mode": _ec_mode,
+                        "ec_p80": _ec_p80, "ec_p90": _ec_p90, "ec_p95": _ec_p95,
                     }
                 }
-                # Invalida cache dettaglio finestre al cambio run
                 st.session_state.pop("wfa_detail_windows", None)
                 st.session_state.pop("wfa_detail_sig", None)
                 st.success("\u2705 Elaborazione completata!")
@@ -637,7 +780,10 @@ if uploaded_file is not None:
             hist_alloc_df = res["hist_alloc_df"]
             exclusions_df = res["exclusions_df"]
             roc_filter_df = res.get("roc_filter_df", pd.DataFrame())
+            ec_warnings_df= res.get("ec_warnings_df", pd.DataFrame())
             run_params    = res["params"]
+            _pnl_col      = res.get("pnl_col", "Weighted Net PnL")
+            _ec_active    = res.get("ec_enabled", False)
 
             st.header("1. Allocazione Corrente")
             latest_start = hist_alloc_df['OOS Start'].max()
@@ -654,8 +800,18 @@ if uploaded_file is not None:
             c5.info(f"\U0001f3db\ufe0f Top-N: **{run_params['top_n']}** | Max/gr: **{run_params['max_per_group']}**")
             c6.info(f"\u2696\ufe0f **{run_params['full_weight_count']}\u00d7{run_params['full_weight_pct']}%** + **{run_params['top_n']-run_params['full_weight_count']}\u00d7{run_params['bench_weight_pct']}%**")
 
+            if _ec_active:
+                st.info(
+                    f"\U0001f4c9 **Equity Control attivo** \u2014 Modalita: **{run_params['ec_capital_mode']}** "
+                    f"| Soglie DD IS: P{run_params['ec_p80']} / P{run_params['ec_p90']} / P{run_params['ec_p95']} "
+                    f"| PnL visualizzato: `EC Weighted Net PnL`"
+                )
+
             latest_alloc = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start].copy()
-            disp = latest_alloc[['Rank','Strategy','Group','Score IS','Metric','Weight','Banned Days']].copy()
+            disp_cols = ['Rank','Strategy','Group','Score IS','Metric','Weight','Banned Days']
+            if _ec_active and 'EC P80' in latest_alloc.columns:
+                disp_cols += ['EC P80', 'EC P90', 'EC P95']
+            disp = latest_alloc[disp_cols].copy()
             disp.rename(columns={'Score IS': f"Score IS ({run_params['ranking_metric']})", 'Metric': 'Metrica'}, inplace=True)
             disp['Weight'] = (disp['Weight'] * 100).round(0).astype(int).astype(str) + '%'
             disp['Giorni Spenti (CUSUM)'] = disp['Banned Days'].apply(format_banned_days)
@@ -669,26 +825,41 @@ if uploaded_file is not None:
             if not roc_filter_df.empty:
                 latest_roc_excl = roc_filter_df[roc_filter_df['OOS Start'] == latest_start]
                 if not latest_roc_excl.empty: _show_logs.append(("ROC filter", latest_roc_excl))
+            if _ec_active and not ec_warnings_df.empty:
+                latest_ec_warn = ec_warnings_df[ec_warnings_df['OOS Start'] == latest_start]
+                if not latest_ec_warn.empty: _show_logs.append(("EC affidabilita IS", latest_ec_warn))
             for log_label, log_df in _show_logs:
-                st.warning(f"\u26a0\ufe0f Strategie escluse ({log_label}):")
-                st.dataframe(log_df[['Strategy','Motivo']], use_container_width=True, hide_index=True)
+                st.warning(f"\u26a0\ufe0f Strategie escluse/avvisi ({log_label}):")
+                st.dataframe(log_df[['Strategy', log_df.columns[-1]]], use_container_width=True, hide_index=True)
 
             st.header("2. Metriche Out-Of-Sample")
             tab_global, tab_recent = st.tabs(["\U0001f4ca Storico Completo OOS", "\U0001f4c8 Dal 1\u00b0 Settembre 2025"])
             with tab_global:
-                render_metrics(calculate_metrics(final_oos_df), "Metriche \u2014 Storico Completo OOS")
+                render_metrics(calculate_metrics(final_oos_df, _pnl_col), "Metriche \u2014 Storico Completo OOS")
             with tab_recent:
                 recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
-                render_metrics(calculate_metrics(recent_df), "Metriche \u2014 Dal 1\u00b0 Settembre 2025")
+                render_metrics(calculate_metrics(recent_df, _pnl_col), "Metriche \u2014 Dal 1\u00b0 Settembre 2025")
+
+            equity_label = "EC Weighted Net PnL" if _ec_active else "Weighted Net PnL"
 
             st.header("3. Curva Equity \u2014 Storico Completo OOS")
-            all_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+            all_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)[_pnl_col].sum()
             all_cum   = all_daily.cumsum()
             fig_all = go.Figure()
             fig_all.add_trace(go.Scatter(
                 x=all_cum.index, y=all_cum.values, mode='lines', fill='tozeroy',
-                line=dict(color='#00d4ff', width=2), fillcolor='rgba(0,212,255,0.08)'
+                line=dict(color='#00d4ff', width=2), fillcolor='rgba(0,212,255,0.08)',
+                name=equity_label,
             ))
+            # Se EC attivo, aggiungi anche la curva senza EC per confronto
+            if _ec_active and 'Weighted Net PnL' in final_oos_df.columns:
+                base_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+                base_cum   = base_daily.cumsum()
+                fig_all.add_trace(go.Scatter(
+                    x=base_cum.index, y=base_cum.values, mode='lines',
+                    line=dict(color='#7a9abf', width=1.5, dash='dot'),
+                    name='Senza EC', opacity=0.6,
+                ))
             fig_all.update_layout(title="Equity Cumulativa WFA \u2014 Storico Completo",
                 xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
             st.plotly_chart(fig_all, use_container_width=True)
@@ -696,13 +867,22 @@ if uploaded_file is not None:
             st.header("4. Curva Equity \u2014 Dal 1\u00b0 Settembre 2025")
             recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
             if not recent_df.empty:
-                rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+                rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)[_pnl_col].sum()
                 rec_cum   = rec_daily.cumsum()
                 fig_rec = go.Figure()
                 fig_rec.add_trace(go.Scatter(
                     x=rec_cum.index, y=rec_cum.values, mode='lines', fill='tozeroy',
-                    line=dict(color='#f59e0b', width=2), fillcolor='rgba(245,158,11,0.08)'
+                    line=dict(color='#f59e0b', width=2), fillcolor='rgba(245,158,11,0.08)',
+                    name=equity_label,
                 ))
+                if _ec_active and 'Weighted Net PnL' in recent_df.columns:
+                    base_rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+                    base_rec_cum   = base_rec_daily.cumsum()
+                    fig_rec.add_trace(go.Scatter(
+                        x=base_rec_cum.index, y=base_rec_cum.values, mode='lines',
+                        line=dict(color='#7a9abf', width=1.5, dash='dot'),
+                        name='Senza EC', opacity=0.6,
+                    ))
                 fig_rec.update_layout(title="Equity Cumulativa WFA \u2014 Dal 1\u00b0 Settembre 2025",
                     xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
                 st.plotly_chart(fig_rec, use_container_width=True)
@@ -804,7 +984,6 @@ if uploaded_file is not None:
             else:
                 _n_win = len(_windows_detail)
 
-                # ── Box Plot PF per finestra OOS ──────────────────────────────
                 st.markdown("#### \U0001f3af Box Plot PF per finestra OOS")
                 _pf_vals = [w["pf"] for w in _windows_detail]
                 _rng = np.random.default_rng(42)
@@ -847,7 +1026,6 @@ if uploaded_file is not None:
                 )
                 st.plotly_chart(fig_wfa_box, use_container_width=True)
 
-                # ── PnL per finestra OOS ──────────────────────────────────────
                 st.markdown("#### \U0001f4c5 PnL per finestra OOS")
                 st.caption("Verde = finestra profittevole \u00b7 Rosso = finestra in perdita \u00b7 Linea tratteggiata = break-even.")
 
@@ -885,7 +1063,6 @@ if uploaded_file is not None:
                 )
                 st.plotly_chart(fig_wfa_pnl, use_container_width=True)
 
-                # ── Frequenza strategie nelle finestre OOS ────────────────────
                 _all_selected = []
                 for _w in _windows_detail:
                     _all_selected.extend(_w.get("selected_strategies", []))
