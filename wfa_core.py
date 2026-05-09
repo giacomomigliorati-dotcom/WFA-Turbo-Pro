@@ -215,12 +215,25 @@ def apply_equity_control(
 ) -> pd.DataFrame:
     """Applica l'equity control a una finestra OOS di una strategia.
 
+    Principio: equity pura vs equity pesata
+    ----------------------------------------
+    Il drawdown usato per calcolare il RiskFactor e misurato sull'EQUITY PURA,
+    cioe la somma dei Net PnL reali senza moltiplicatori di peso ne di RiskFactor.
+    Questo e fondamentale: una strategia in "panchina" (weight=40%) non deve
+    sembrare piu sana di una "titolare" (weight=80%) solo perche il suo PnL
+    pesato e numericamente piu piccolo.
+
+    Separazione netta dei due piani:
+      - Tracking DD  : usa sempre Net PnL puro (colonna "Net PnL")
+      - Output portafoglio: EC Weighted Net PnL = Weighted Net PnL * RiskFactor
+
     Logica di restart graduale
     --------------------------
-    Quando RF == 0.0 (stop totale, DD >= P95), la strategia non apre nuove
-    posizioni MA l'equity di *tracking* continua ad aggiornarsi con il PnL
-    reale (non pesato). Questo permette al drawdown di ridursi naturalmente
-    durante lo stop, rendendo possibile il rientro automatico ai livelli:
+    Quando RF == 0.0 (stop totale, DD >= P95), la strategia non contribuisce
+    al portafoglio (EC Weighted Net PnL = 0), ma il tracking dell'equity pura
+    continua ad aggiornarsi con il Net PnL reale. Questo permette al drawdown
+    di ridursi naturalmente durante lo stop, rendendo possibile il rientro
+    automatico ai livelli:
         0.00  ->  0.25  (DD scende sotto P95)
         0.25  ->  0.50  (DD scende sotto P90)
         0.50  ->  1.00  (DD scende sotto P80)
@@ -232,14 +245,14 @@ def apply_equity_control(
     ----------------
         RiskFactor            : float 0 / 0.25 / 0.5 / 1.0 per ogni trade
         EC Weighted Net PnL   : Weighted Net PnL * RiskFactor
-        EC Tracking Equity    : equity interna usata per calcolare il DD
+        EC Tracking Equity    : equity pura interna usata per calcolare il DD
 
     Parametri
     ---------
     strat_oos       : DataFrame OOS gia pesato (colonna 'Weighted Net PnL')
     thresholds      : output di compute_dd_percentiles_from_is
-    capital_mode    : "Trailing" (equity cumulativa tra finestre) | "Fisso"
-    start_equity    : equity cumulativa di partenza (usata solo in Trailing)
+    capital_mode    : "Trailing" (equity pura cumulativa tra finestre) | "Fisso"
+    start_equity    : equity pura di partenza (usata solo in Trailing)
     """
     df = strat_oos.copy().sort_values("Date Closed").reset_index(drop=True)
 
@@ -253,22 +266,18 @@ def apply_equity_control(
     risk_factors      = []
     tracking_equities = []
 
-    for pnl_weighted in df["Weighted Net PnL"]:
-        # 1. Calcola DD corrente e RiskFactor PRIMA di eseguire il trade
+    for pnl_raw, pnl_weighted in zip(df["Net PnL"], df["Weighted Net PnL"]):
+        # 1. Calcola DD corrente sull'EQUITY PURA e ottieni RiskFactor
         dd_abs = max(0.0, peak - equity)
         rf     = get_risk_factor(dd_abs, thresholds)
         risk_factors.append(rf)
         tracking_equities.append(equity)
 
-        # 2. Aggiorna equity di tracking
-        #    RF > 0 : trade eseguito -> equity += PnL_pesato * RF
-        #    RF = 0 : stop totale    -> equity += PnL_pesato (tracking-only,
-        #             nessun contributo al risultato reale; permette il recovery
-        #             del DD e quindi il restart graduale)
-        if rf > 0.0:
-            equity += pnl_weighted * rf
-        else:
-            equity += pnl_weighted   # tracking-only per restart graduale
+        # 2. Aggiorna equity di tracking usando SEMPRE il Net PnL puro.
+        #    Il peso (0.8 / 0.4) e il RiskFactor NON entrano nel tracking:
+        #    cio garantisce che il DD misurato rifletta la salute reale
+        #    della strategia, indipendentemente dal suo peso nel portafoglio.
+        equity += pnl_raw
 
         if equity > peak:
             peak = equity
