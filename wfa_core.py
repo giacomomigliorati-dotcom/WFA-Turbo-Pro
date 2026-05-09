@@ -113,3 +113,139 @@ def format_banned_days(banned_list):
     if not banned_list:
         return "Nessuno"
     return ", ".join([GIORNI_SETTIMANA[d] for d in banned_list if d < len(GIORNI_SETTIMANA)])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EQUITY CONTROL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_EC_ENABLED      = False
+DEFAULT_EC_CAPITAL_MODE = "Trailing"   # "Fisso" | "Trailing"
+DEFAULT_EC_P80          = 80
+DEFAULT_EC_P90          = 90
+DEFAULT_EC_P95          = 95
+EC_MIN_DAYS_IS          = 60          # soglia avviso affidabilita IS
+
+
+def compute_dd_percentiles_from_is(
+    strat_is: pd.DataFrame,
+    p80: int = DEFAULT_EC_P80,
+    p90: int = DEFAULT_EC_P90,
+    p95: int = DEFAULT_EC_P95,
+) -> dict:
+    """Calcola i percentili del drawdown giornaliero dalla finestra IS.
+
+    Ritorna un dict con chiavi:
+        dd_p80, dd_p90, dd_p95  : valori di drawdown (float, negativi o zero)
+        daily_dd_series         : pd.Series drawdown giornaliero
+        n_days                  : numero di giorni di trading IS
+        reliable                : bool -- True se n_days >= EC_MIN_DAYS_IS
+        warning                 : str | None -- messaggio se non affidabile
+    """
+    if strat_is is None or strat_is.empty:
+        return {
+            "dd_p80": 0.0, "dd_p90": 0.0, "dd_p95": 0.0,
+            "daily_dd_series": pd.Series(dtype=float),
+            "n_days": 0, "reliable": False,
+            "warning": "Nessun dato IS disponibile.",
+        }
+
+    df = strat_is.copy()
+    df["_date"] = pd.to_datetime(df["Date Closed"]).dt.date
+    daily_pnl = df.groupby("_date")["Net PnL"].sum().sort_index()
+    equity    = daily_pnl.cumsum()
+    peak      = equity.cummax()
+    dd_series = equity - peak          # valori <= 0
+
+    dd_real   = dd_series[dd_series < 0]
+    n_days    = len(daily_pnl)
+    reliable  = n_days >= EC_MIN_DAYS_IS
+    warning   = (
+        f"Solo {n_days} giorni di trading IS (minimo consigliato: {EC_MIN_DAYS_IS})."
+        if not reliable else None
+    )
+
+    if dd_real.empty:
+        return {
+            "dd_p80": 0.0, "dd_p90": 0.0, "dd_p95": 0.0,
+            "daily_dd_series": dd_series,
+            "n_days": n_days, "reliable": reliable, "warning": warning,
+        }
+
+    return {
+        "dd_p80": float(np.percentile(dd_real.values, p80)),
+        "dd_p90": float(np.percentile(dd_real.values, p90)),
+        "dd_p95": float(np.percentile(dd_real.values, p95)),
+        "daily_dd_series": dd_series,
+        "n_days": n_days, "reliable": reliable, "warning": warning,
+    }
+
+
+def get_risk_factor(current_dd_abs: float, thresholds: dict) -> float:
+    """Mappa il drawdown corrente (valore assoluto >= 0) a un RiskFactor.
+
+    Schema a 4 livelli:
+        0.0          <= dd < |P80|  ->  1.00  (piena operativita)
+        |P80|        <= dd < |P90|  ->  0.50  (half size)
+        |P90|        <= dd < |P95|  ->  0.25  (quarter size)
+        |P95|        <= dd          ->  0.00  (stop totale)
+    """
+    t80 = abs(thresholds.get("dd_p80", 0.0))
+    t90 = abs(thresholds.get("dd_p90", 0.0))
+    t95 = abs(thresholds.get("dd_p95", 0.0))
+
+    if t95 == 0.0:
+        return 1.0   # nessun DD in IS => mai fermare
+
+    if current_dd_abs < t80:
+        return 1.00
+    elif current_dd_abs < t90:
+        return 0.50
+    elif current_dd_abs < t95:
+        return 0.25
+    else:
+        return 0.00
+
+
+def apply_equity_control(
+    strat_oos: pd.DataFrame,
+    thresholds: dict,
+    capital_mode: str = "Trailing",
+    start_equity: float = 0.0,
+) -> pd.DataFrame:
+    """Applica l'equity control a una finestra OOS di una strategia.
+
+    Aggiunge le colonne:
+        RiskFactor            : float 0/0.25/0.5/1.0 per ogni trade
+        EC Weighted Net PnL   : Weighted Net PnL * RiskFactor
+
+    Parametri
+    ---------
+    strat_oos       : DataFrame OOS gia pesato (colonna 'Weighted Net PnL')
+    thresholds      : output di compute_dd_percentiles_from_is
+    capital_mode    : "Trailing" (equity cumulativa tra finestre) | "Fisso"
+    start_equity    : equity cumulativa di partenza (usata solo in Trailing)
+    """
+    df = strat_oos.copy().sort_values("Date Closed").reset_index(drop=True)
+
+    if "Weighted Net PnL" not in df.columns:
+        df["Weighted Net PnL"] = df.get("Net PnL", 0.0)
+
+    equity = start_equity
+    peak   = start_equity
+    if capital_mode == "Fisso":
+        equity = 0.0
+        peak   = 0.0
+
+    risk_factors = []
+    for pnl in df["Weighted Net PnL"]:
+        dd_abs = max(0.0, peak - equity)
+        rf     = get_risk_factor(dd_abs, thresholds)
+        risk_factors.append(rf)
+        equity += pnl * rf
+        if equity > peak:
+            peak = equity
+
+    df["RiskFactor"]          = risk_factors
+    df["EC Weighted Net PnL"] = df["Weighted Net PnL"] * df["RiskFactor"]
+    return df
