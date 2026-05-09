@@ -19,7 +19,7 @@ DEFAULT_ROC_FILTER_ENABLED = False
 DEFAULT_ROC_FILTER_STEPS  = 2
 
 
-# ─── FUNZIONI METRICHE IS ─────────────────────────────────────────────────────
+# ─── FUNZIONI METRICHE IS ────────────────────────────────────────────────────
 
 def calc_omega(strat_is: pd.DataFrame) -> float:
     """Omega Ratio: usa P/L % se disponibile, altrimenti Net PnL assoluto."""
@@ -51,7 +51,7 @@ def calc_sortino(strat_is: pd.DataFrame) -> float:
 
 
 def calc_ulcer(strat_is: pd.DataFrame) -> float:
-    """Ulcer Index (minore = migliore; ranking verrà invertito)."""
+    """Ulcer Index (minore = migliore; ranking verra invertito)."""
     daily = strat_is.groupby(strat_is['Date Closed'].dt.date)['Net PnL'].sum()
     cum = daily.cumsum()
     peak = cum.cummax()
@@ -90,7 +90,7 @@ def passes_roc_filter(strat_is: pd.DataFrame, filter_steps: int) -> bool:
     return calc_roc(strat_is, filter_steps) >= 0
 
 
-# ─── CUSUM WEEKDAY KILLER ─────────────────────────────────────────────────────
+# ─── CUSUM WEEKDAY KILLER ────────────────────────────────────────────────────
 
 def compute_cusum_banned(is_data_strat: pd.DataFrame):
     """Restituisce la lista di weekday (0=Mon) bannati via CUSUM."""
@@ -115,9 +115,9 @@ def format_banned_days(banned_list):
     return ", ".join([GIORNI_SETTIMANA[d] for d in banned_list if d < len(GIORNI_SETTIMANA)])
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # EQUITY CONTROL
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_EC_ENABLED      = False
 DEFAULT_EC_CAPITAL_MODE = "Trailing"   # "Fisso" | "Trailing"
@@ -185,10 +185,10 @@ def get_risk_factor(current_dd_abs: float, thresholds: dict) -> float:
     """Mappa il drawdown corrente (valore assoluto >= 0) a un RiskFactor.
 
     Schema a 4 livelli:
-        0.0          <= dd < |P80|  ->  1.00  (piena operativita)
-        |P80|        <= dd < |P90|  ->  0.50  (half size)
-        |P90|        <= dd < |P95|  ->  0.25  (quarter size)
-        |P95|        <= dd          ->  0.00  (stop totale)
+        0.0     <= dd < |P80|  ->  1.00  (piena operativita)
+        |P80|   <= dd < |P90|  ->  0.50  (half size)
+        |P90|   <= dd < |P95|  ->  0.25  (quarter size)
+        |P95|   <= dd          ->  0.00  (stop totale)
     """
     t80 = abs(thresholds.get("dd_p80", 0.0))
     t90 = abs(thresholds.get("dd_p90", 0.0))
@@ -215,9 +215,24 @@ def apply_equity_control(
 ) -> pd.DataFrame:
     """Applica l'equity control a una finestra OOS di una strategia.
 
-    Aggiunge le colonne:
-        RiskFactor            : float 0/0.25/0.5/1.0 per ogni trade
+    Logica di restart graduale
+    --------------------------
+    Quando RF == 0.0 (stop totale, DD >= P95), la strategia non apre nuove
+    posizioni MA l'equity di *tracking* continua ad aggiornarsi con il PnL
+    reale (non pesato). Questo permette al drawdown di ridursi naturalmente
+    durante lo stop, rendendo possibile il rientro automatico ai livelli:
+        0.00  ->  0.25  (DD scende sotto P95)
+        0.25  ->  0.50  (DD scende sotto P90)
+        0.50  ->  1.00  (DD scende sotto P80)
+
+    In modalita Fisso il restart e garantito all'inizio di ogni finestra OOS
+    perche equity e peak ripartono da zero.
+
+    Colonne aggiunte
+    ----------------
+        RiskFactor            : float 0 / 0.25 / 0.5 / 1.0 per ogni trade
         EC Weighted Net PnL   : Weighted Net PnL * RiskFactor
+        EC Tracking Equity    : equity interna usata per calcolare il DD
 
     Parametri
     ---------
@@ -231,21 +246,34 @@ def apply_equity_control(
     if "Weighted Net PnL" not in df.columns:
         df["Weighted Net PnL"] = df.get("Net PnL", 0.0)
 
-    equity = start_equity
-    peak   = start_equity
-    if capital_mode == "Fisso":
-        equity = 0.0
-        peak   = 0.0
+    # In modalita Fisso si azzera a ogni finestra OOS -> restart automatico
+    equity = 0.0 if capital_mode == "Fisso" else start_equity
+    peak   = equity
 
-    risk_factors = []
-    for pnl in df["Weighted Net PnL"]:
+    risk_factors      = []
+    tracking_equities = []
+
+    for pnl_weighted in df["Weighted Net PnL"]:
+        # 1. Calcola DD corrente e RiskFactor PRIMA di eseguire il trade
         dd_abs = max(0.0, peak - equity)
         rf     = get_risk_factor(dd_abs, thresholds)
         risk_factors.append(rf)
-        equity += pnl * rf
+        tracking_equities.append(equity)
+
+        # 2. Aggiorna equity di tracking
+        #    RF > 0 : trade eseguito -> equity += PnL_pesato * RF
+        #    RF = 0 : stop totale    -> equity += PnL_pesato (tracking-only,
+        #             nessun contributo al risultato reale; permette il recovery
+        #             del DD e quindi il restart graduale)
+        if rf > 0.0:
+            equity += pnl_weighted * rf
+        else:
+            equity += pnl_weighted   # tracking-only per restart graduale
+
         if equity > peak:
             peak = equity
 
     df["RiskFactor"]          = risk_factors
     df["EC Weighted Net PnL"] = df["Weighted Net PnL"] * df["RiskFactor"]
+    df["EC Tracking Equity"]  = tracking_equities
     return df
