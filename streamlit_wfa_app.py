@@ -736,11 +736,9 @@ if uploaded_file is not None:
                                         capital_mode=_ec_mode,
                                         start_equity=start_eq,
                                     )
-                                    # Aggiorna trailing equity
+                                    # Aggiorna trailing equity: deve usare sempre Net PnL puro
                                     if _ec_mode == "Trailing":
-                                        ec_trailing_equity[strat_name] = (
-                                            start_eq + strat_oos['EC Weighted Net PnL'].sum()
-                                        )
+                                        ec_trailing_equity[strat_name] = start_eq + strat_oos['Net PnL'].sum()
 
                                 oos_results.append(strat_oos)
                     current_oos_start = current_oos_end
