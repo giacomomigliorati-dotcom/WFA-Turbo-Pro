@@ -30,6 +30,20 @@ from wfa_core import (
     format_banned_days,
     compute_dd_percentiles_from_is,
     apply_equity_control,
+    apply_portfolio_sizing,
+)
+from wfa_sizing import (
+    StrategySizingConfig,
+    PortfolioSizingParams,
+    clean_money,
+    DEFAULT_SIZING_ENABLED,
+    DEFAULT_INITIAL_CAPITAL,
+    DEFAULT_MAX_DAILY_LOSS_PCT,
+    DEFAULT_COMPOUNDING,
+    DEFAULT_CAP_PCT,
+    DEFAULT_SL_USD,
+    DEFAULT_SL_PCT,
+    BENCH_WEIGHT_THRESHOLD,
 )
 from wfa_optimizer_module import render_optimizer_tab, run_wfa_single_windowed, WFAParams
 
@@ -139,6 +153,10 @@ configurabile (multipli di OOS step) è negativo. Utile per bloccare strategie i
 Schema a 4 livelli: DD < P80 → size piena; P80–P90 → 50%; P90–P95 → 25%; DD >= P95 → stop totale.
 Modalità Trailing (equity cumulativa tra finestre) o Fisso (reset a ogni finestra OOS).
 
+**9. Position Sizing (opzionale)** — Calcola il numero di contratti da allocare per ogni trade OOS.
+Basato su capitale, cap% per strategia, stop-loss per contratto e budget giornaliero massimo.
+Le strategie in panchina con RiskFactor EC ≤ 0.50 vengono escluse dall'allocazione contratti.
+
 ---
 
 ### 💾 Backup configurazione
@@ -177,11 +195,6 @@ OZONE_LAYOUT = dict(
 )
 
 # ─── FUNZIONI CORE GENERALI ───────────────────────────────────────────────────
-def clean_money(val):
-    if pd.isna(val): return 0
-    if isinstance(val, (int, float)): return val
-    return float(str(val).replace('$', '').replace(',', ''))
-
 def calculate_metrics(df, pnl_col='Weighted Net PnL'):
     if df.empty: return {}
     pnl = df[pnl_col]
@@ -239,7 +252,7 @@ def render_metrics(m, label):
 # ─── FUNZIONI JSON CONFIG ─────────────────────────────────────────────────────
 def build_config_payload():
     return {
-        "version": 4,
+        "version": 5,
         "group_names":          st.session_state.get("group_names", []),
         "strategy_mapping":     st.session_state.get("strategy_mapping", {}),
         "max_per_group":        int(st.session_state.get("max_per_group",        DEFAULT_MAX_PER_GROUP)),
@@ -256,6 +269,12 @@ def build_config_payload():
         "ec_p80":               int(st.session_state.get("ec_p80",               DEFAULT_EC_P80)),
         "ec_p90":               int(st.session_state.get("ec_p90",               DEFAULT_EC_P90)),
         "ec_p95":               int(st.session_state.get("ec_p95",               DEFAULT_EC_P95)),
+        # Sizing
+        "sizing_enabled":            bool(st.session_state.get("sizing_enabled",            DEFAULT_SIZING_ENABLED)),
+        "sizing_initial_capital":    float(st.session_state.get("sizing_initial_capital",   DEFAULT_INITIAL_CAPITAL)),
+        "sizing_max_daily_loss_pct": float(st.session_state.get("sizing_max_daily_loss_pct",DEFAULT_MAX_DAILY_LOSS_PCT)),
+        "sizing_compounding":        bool(st.session_state.get("sizing_compounding",         DEFAULT_COMPOUNDING)),
+        "sizing_strategy_configs":   st.session_state.get("sizing_strategy_configs",         {}),
     }
 
 def apply_config_payload(payload, all_strategies):
@@ -289,6 +308,16 @@ def apply_config_payload(payload, all_strategies):
     st.session_state["ec_p80"]            = max(1, min(99, int(payload.get("ec_p80", DEFAULT_EC_P80))))
     st.session_state["ec_p90"]            = max(1, min(99, int(payload.get("ec_p90", DEFAULT_EC_P90))))
     st.session_state["ec_p95"]            = max(1, min(99, int(payload.get("ec_p95", DEFAULT_EC_P95))))
+    # Sizing fields (compatibilità con JSON versione 4 — se assenti usa defaults)
+    st.session_state["sizing_enabled"]            = bool(payload.get("sizing_enabled",            DEFAULT_SIZING_ENABLED))
+    st.session_state["sizing_initial_capital"]    = max(1000.0, float(payload.get("sizing_initial_capital",    DEFAULT_INITIAL_CAPITAL)))
+    st.session_state["sizing_max_daily_loss_pct"] = max(0.1, min(20.0, float(payload.get("sizing_max_daily_loss_pct", DEFAULT_MAX_DAILY_LOSS_PCT))))
+    st.session_state["sizing_compounding"]        = bool(payload.get("sizing_compounding",         DEFAULT_COMPOUNDING))
+    raw_cfgs = payload.get("sizing_strategy_configs", {})
+    if isinstance(raw_cfgs, dict):
+        st.session_state["sizing_strategy_configs"] = raw_cfgs
+    else:
+        st.session_state["sizing_strategy_configs"] = {}
 
 # ─── INIT SESSION STATE ───────────────────────────────────────────────────────
 _SS_DEFAULTS = {
@@ -307,6 +336,12 @@ _SS_DEFAULTS = {
     "ec_p80":             DEFAULT_EC_P80,
     "ec_p90":             DEFAULT_EC_P90,
     "ec_p95":             DEFAULT_EC_P95,
+    # Sizing defaults
+    "sizing_enabled":            DEFAULT_SIZING_ENABLED,
+    "sizing_initial_capital":    DEFAULT_INITIAL_CAPITAL,
+    "sizing_max_daily_loss_pct": DEFAULT_MAX_DAILY_LOSS_PCT,
+    "sizing_compounding":        DEFAULT_COMPOUNDING,
+    "sizing_strategy_configs":   {},
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -494,6 +529,81 @@ if uploaded_file is not None:
         )
     st.sidebar.divider()
 
+    # ── POSITION SIZING ───────────────────────────────────────────────────────
+    st.sidebar.subheader("\U0001f4b0 Position Sizing")
+    st.sidebar.toggle(
+        "Attiva Position Sizing",
+        help=(
+            "Calcola il numero di contratti da allocare per ogni trade OOS "
+            "in base a capitale, cap% per strategia e stop-loss per contratto. "
+            "Richiede la colonna 'Premium' nel CSV."
+        ),
+        key="sizing_enabled",
+    )
+
+    if st.session_state["sizing_enabled"]:
+        st.sidebar.number_input(
+            "Capitale iniziale ($)",
+            min_value=1_000, max_value=10_000_000, step=1_000,
+            help=f"Default: ${DEFAULT_INITIAL_CAPITAL:,.0f}",
+            key="sizing_initial_capital",
+        )
+        st.sidebar.number_input(
+            "Max perdita giornaliera (%)",
+            min_value=0.1, max_value=20.0, step=0.1,
+            help=f"Budget di rischio giornaliero come % del capitale. Default: {DEFAULT_MAX_DAILY_LOSS_PCT}%",
+            key="sizing_max_daily_loss_pct",
+        )
+        st.sidebar.toggle(
+            "Compounding (reinvestimento profitti)",
+            help="Se attivo, il capitale si aggiorna con i profitti/perdite realizzati finestra per finestra.",
+            key="sizing_compounding",
+        )
+
+        _bench_count_sz = int(st.session_state["top_n"]) - int(st.session_state["full_weight_count"])
+        if _bench_count_sz > 0:
+            st.sidebar.warning(
+                f"⚠️ Sizing attivo con {_bench_count_sz} strateg{'ia' if _bench_count_sz == 1 else 'ie'} in panchina. "
+                f"Le strategie in panchina con RiskFactor EC ≤ {EC_RF_BENCH_CUTOFF:.0%} "
+                "vengono escluse dall'allocazione contratti. "
+                "Per sizing ottimale considera Full Weight = Top-N (nessuna panchina)."
+            )
+
+        with st.sidebar.expander("⚙️ Parametri per strategia", expanded=False):
+            st.caption(
+                "Cap %: % del capitale allocabile per questa strategia. "
+                "SL USD: stop-loss per contratto in dollari. "
+                "SL %: stop-loss come % del premio (sovrascrive SL USD se > 0)."
+            )
+            current_cfgs = st.session_state.get("sizing_strategy_configs", {})
+            updated_cfgs = {}
+            for strat in all_strategies_in_file:
+                cfg = current_cfgs.get(strat, {})
+                st.markdown(f"**{strat}**")
+                c1, c2, c3 = st.columns(3)
+                cap = c1.number_input(
+                    "Cap %", min_value=0.1, max_value=100.0, step=0.5,
+                    value=float(cfg.get("cap_pct", DEFAULT_CAP_PCT)),
+                    key=f"sz_cap_{strat}",
+                )
+                sl_usd = c2.number_input(
+                    "SL $", min_value=1.0, max_value=50_000.0, step=10.0,
+                    value=float(cfg.get("sl_usd", DEFAULT_SL_USD)),
+                    key=f"sz_slusd_{strat}",
+                )
+                sl_pct = c3.number_input(
+                    "SL %", min_value=0.0, max_value=100.0, step=0.5,
+                    value=float(cfg.get("sl_pct", DEFAULT_SL_PCT)),
+                    key=f"sz_slpct_{strat}",
+                )
+                updated_cfgs[strat] = {"cap_pct": cap, "sl_usd": sl_usd, "sl_pct": sl_pct}
+            if st.button("\u2705 Salva parametri sizing"):
+                st.session_state["sizing_strategy_configs"] = updated_cfgs
+                st.sidebar.success("Parametri sizing salvati — esporta il JSON!")
+                st.rerun()
+
+    st.sidebar.divider()
+
     st.sidebar.subheader("Limite per gruppo")
     st.sidebar.number_input(
         "Max strategie stesso gruppo",
@@ -577,6 +687,12 @@ if uploaded_file is not None:
     ec_p80           = int(st.session_state["ec_p80"])
     ec_p90           = int(st.session_state["ec_p90"])
     ec_p95           = int(st.session_state["ec_p95"])
+    # Sizing aliases
+    sizing_enabled            = bool(st.session_state["sizing_enabled"])
+    sizing_initial_capital    = float(st.session_state["sizing_initial_capital"])
+    sizing_max_daily_loss_pct = float(st.session_state["sizing_max_daily_loss_pct"])
+    sizing_compounding        = bool(st.session_state["sizing_compounding"])
+    sizing_strategy_configs   = st.session_state.get("sizing_strategy_configs", {})
 
     # ─── TAB PRINCIPALI ───────────────────────────────────────────────────────
     tab_wfa, tab_opt = st.tabs(["\U0001f4ca Walk-Forward", "\u2699\ufe0f Ottimizzatore"])
@@ -594,6 +710,11 @@ if uploaded_file is not None:
             ec_label = (
                 f" &nbsp;|&nbsp; \U0001f4c9 EC: <b style='color:#22c55e'>{ec_capital_mode}</b>"
             ) if ec_enabled else ""
+            sizing_label = (
+                f" &nbsp;|&nbsp; \U0001f4b0 Sizing: <b style='color:#f59e0b'>ON</b>"
+                f" | Capital: <b style='color:#f59e0b'>${sizing_initial_capital:,.0f}</b>"
+                f" | MaxDD: <b style='color:#f59e0b'>{sizing_max_daily_loss_pct:.1f}%</b>"
+            ) if sizing_enabled else ""
             ranking_label_color = "#f59e0b" if ranking_metric != "Omega Ratio" else "#00d4ff"
             st.markdown(
                 f"<div style='padding-top:10px; color:#7a9abf; font-size:0.88rem;'>"
@@ -603,7 +724,7 @@ if uploaded_file is not None:
                 f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{full_weight_count}\u00d7{full_weight_pct}%</b>"
                 f" + <b style='color:#f59e0b'>{bench_count}\u00d7{bench_weight_pct}%</b>"
                 f" &nbsp;|&nbsp; Max/gr: <b style='color:#00d4ff'>{max_per_group}</b>"
-                + roc_filter_label + ec_label + "</div>",
+                + roc_filter_label + ec_label + sizing_label + "</div>",
                 unsafe_allow_html=True
             )
 
@@ -623,516 +744,267 @@ if uploaded_file is not None:
             _ec_p80   = ec_p80
             _ec_p90   = ec_p90
             _ec_p95   = ec_p95
+            _sz_en    = sizing_enabled
+            _sz_cap   = sizing_initial_capital
+            _sz_mdl   = sizing_max_daily_loss_pct
+            _sz_comp  = sizing_compounding
+            _sz_cfgs  = dict(sizing_strategy_configs)
 
             with st.spinner("Elaborazione Walk-Forward in corso..."):
                 df_filtered = df_raw.copy()
-                df_filtered['Date Opened'] = pd.to_datetime(df_filtered['Date Opened'])
-                df_filtered['Date Closed'] = pd.to_datetime(df_filtered['Date Closed'])
-                df_filtered['weekday_open'] = df_filtered['Date Opened'].dt.weekday
-                df_filtered['P/L'] = df_filtered['P/L'].apply(clean_money)
-                df_filtered['P/L %'] = df_filtered['P/L %'].apply(
-                    lambda x: float(str(x).replace('%','').replace(',','')) if pd.notna(x) else np.nan)
-                df_filtered['Opening Commissions + Fees'] = df_filtered['Opening Commissions + Fees'].fillna(0).apply(clean_money)
-                df_filtered['Closing Commissions + Fees'] = df_filtered['Closing Commissions + Fees'].fillna(0).apply(clean_money)
-                df_filtered['Net PnL'] = (
-                    df_filtered['P/L']
-                    - df_filtered['Opening Commissions + Fees']
-                    - df_filtered['Closing Commissions + Fees']
-                )
-                df_filtered = df_filtered.sort_values('Date Closed').reset_index(drop=True)
-                min_date  = df_filtered['Date Closed'].min()
-                max_date  = df_filtered['Date Closed'].max()
-                current_oos_start = min_date + pd.DateOffset(months=12)
-                oos_results, historical_allocations, cusum_exclusions_log, roc_filter_log = [], [], [], []
-                ec_warnings_log = []
+                df_filtered['Date Opened'] = pd.to_datetime(df_filtered['Date Opened'], dayfirst=True, errors='coerce')
+                df_filtered['Date Closed'] = pd.to_datetime(df_filtered['Date Closed'], dayfirst=True, errors='coerce')
+                df_filtered = df_filtered.dropna(subset=['Date Opened', 'Date Closed'])
+                df_filtered['Net PnL'] = df_filtered['Net PnL'].apply(clean_money)
+                df_filtered['weekday_open'] = df_filtered['Date Opened'].dt.dayofweek
 
-                # EC: dizionario trailing equity per strategia (usato solo in modalita Trailing)
-                ec_trailing_equity: dict = {}
+                min_date = df_filtered['Date Closed'].min()
+                max_date = df_filtered['Date Closed'].max()
+                total_days = (max_date - min_date).days
+                IS_DAYS = 365
 
-                while current_oos_start <= max_date:
-                    current_oos_end  = current_oos_start + pd.Timedelta(days=OOS_STEP_DAYS)
-                    current_is_start = current_oos_start - pd.DateOffset(months=12)
-                    is_data  = df_filtered[(df_filtered['Date Closed'] >= current_is_start)
-                                          & (df_filtered['Date Closed'] < current_oos_start)].copy()
-                    oos_data = df_filtered[(df_filtered['Date Closed'] >= current_oos_start)
-                                          & (df_filtered['Date Closed'] < current_oos_end)].copy()
-                    if is_data.empty:
-                        current_oos_start = current_oos_end
+                windows = []
+                win_start = min_date
+                while True:
+                    win_end   = win_start + pd.Timedelta(days=IS_DAYS)
+                    oos_start = win_end
+                    oos_end   = oos_start + pd.Timedelta(days=OOS_STEP_DAYS)
+                    if oos_end > max_date:
+                        break
+                    windows.append((win_start, win_end, oos_start, oos_end))
+                    win_start = win_start + pd.Timedelta(days=OOS_STEP_DAYS)
+
+                if not windows:
+                    st.error("Dati insufficienti per generare finestre WFA.")
+                    st.stop()
+
+                historical_allocations = []
+                ec_trailing_equity = {}
+                sizing_realized_by_window = []
+                current_capital = _sz_cap
+
+                for win_start, win_end, oos_start, oos_end in windows:
+                    is_data  = df_filtered[(df_filtered['Date Closed'] >= win_start) & (df_filtered['Date Closed'] < win_end)]
+                    oos_data = df_filtered[(df_filtered['Date Closed'] >= oos_start) & (df_filtered['Date Closed'] < oos_end)]
+
+                    if is_data.empty or oos_data.empty:
                         continue
 
-                    valid_strats = is_data['Strategy'].value_counts()
-                    valid_strats = valid_strats[valid_strats >= 5].index.tolist()
-                    is_metrics = []
+                    strategy_scores = {}
+                    cusum_banned_by_strat = {}
+                    ec_thresholds_by_strat = {}
 
-                    for strat in valid_strats:
-                        if strat not in _sm: continue
-                        strat_is = is_data[is_data['Strategy'] == strat].copy()
-                        if _roc_fe and not passes_roc_filter(strat_is, _roc_fs):
-                            roc_filter_log.append({'OOS Start': current_oos_start, 'Strategy': strat,
-                                'Motivo': f"ROC < 0 su {_roc_fs*OOS_STEP_DAYS}gg"})
+                    for sn in is_data['Strategy'].unique():
+                        if not _sm.get(sn, '').strip():
                             continue
+                        strat_is = is_data[is_data['Strategy'] == sn].copy()
                         score, higher_is_better = compute_ranking_score(strat_is, _metric, _roc_s)
-                        banned_days = compute_cusum_banned(strat_is)
-                        active_days = strat_is['weekday_open'].unique().tolist()
-                        remaining   = [d for d in active_days if d not in banned_days]
-                        if not remaining:
-                            cusum_exclusions_log.append({'OOS Start': current_oos_start, 'Strategy': strat,
-                                'Motivo': f"Tutti i giorni bannati: {format_banned_days(banned_days)}"})
+                        if _roc_fe and not passes_roc_filter(strat_is, _roc_fs):
+                            continue
+                        strategy_scores[sn] = (score, higher_is_better)
+                        cusum_banned_by_strat[sn] = compute_cusum_banned(strat_is)
+                        if _ec_en:
+                            ec_thresholds_by_strat[sn] = compute_dd_percentiles_from_is(
+                                strat_is, _ec_p80, _ec_p90, _ec_p95
+                            )
+
+                    if not strategy_scores:
+                        continue
+
+                    representative_hib = next(iter(strategy_scores.values()))[1]
+                    sorted_strats = sorted(
+                        strategy_scores.keys(),
+                        key=lambda s: strategy_scores[s][0],
+                        reverse=representative_hib,
+                    )
+
+                    group_counts = Counter()
+                    selected = []
+                    for sn in sorted_strats:
+                        grp = _sm.get(sn, '')
+                        if group_counts[grp] < _mpg:
+                            selected.append(sn)
+                            group_counts[grp] += 1
+                        if len(selected) >= _top_n:
+                            break
+
+                    if not selected:
+                        continue
+
+                    _fwc_eff = min(_fwc, len(selected))
+                    for rank, sn in enumerate(selected):
+                        weight = _fwp if rank < _fwc_eff else _bwp
+                        strat_oos = oos_data[oos_data['Strategy'] == sn].copy()
+                        if strat_oos.empty:
                             continue
 
-                        # EC: calcola soglie DD dalla finestra IS
-                        ec_thresholds = None
+                        banned_days = cusum_banned_by_strat.get(sn, [])
+                        if banned_days:
+                            strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned_days)]
+                        if strat_oos.empty:
+                            continue
+
+                        strat_oos = strat_oos.copy()
+                        strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
+                        strat_oos['Weight'] = weight
+                        strat_oos['Rank']   = rank + 1
+                        strat_oos['IS Start']  = win_start
+                        strat_oos['IS End']    = win_end
+                        strat_oos['OOS Start'] = oos_start
+                        strat_oos['OOS End']   = oos_end
+
                         if _ec_en:
-                            ec_info = compute_dd_percentiles_from_is(strat_is, _ec_p80, _ec_p90, _ec_p95)
-                            ec_thresholds = ec_info
-                            if ec_info.get("warning"):
-                                ec_warnings_log.append({
-                                    'OOS Start': current_oos_start,
-                                    'Strategy': strat,
-                                    'Warning': ec_info["warning"],
-                                })
+                            thresholds = ec_thresholds_by_strat.get(sn, {})
+                            start_eq   = ec_trailing_equity.get(sn, 0.0) if _ec_mode == "Trailing" else 0.0
+                            strat_oos  = apply_equity_control(strat_oos, thresholds, _ec_mode, start_eq)
+                            # BUG-2 FIX: aggiorna equity trailing usando Net PnL puro (non EC weighted)
+                            if _ec_mode == "Trailing":
+                                ec_trailing_equity[sn] = start_eq + strat_oos["Net PnL"].sum()
+                        else:
+                            strat_oos['RiskFactor']          = 1.0
+                            strat_oos['EC Weighted Net PnL'] = strat_oos['Weighted Net PnL']
+                            strat_oos['EC Tracking Equity']  = 0.0
 
-                        is_metrics.append({'Strategy': strat, 'Group': _sm[strat],
-                            'Score': score, 'Higher_is_better': higher_is_better,
-                            'Net PnL IS': strat_is['Net PnL'].sum(), 'Banned Days': banned_days,
-                            'EC Thresholds': ec_thresholds})
+                        if _sz_en:
+                            cfg_dict = _sz_cfgs.get(sn, {})
+                            sz_cfg = StrategySizingConfig(
+                                cap_pct=float(cfg_dict.get("cap_pct", DEFAULT_CAP_PCT)),
+                                sl_usd=float(cfg_dict.get("sl_usd",  DEFAULT_SL_USD)),
+                                sl_pct=float(cfg_dict.get("sl_pct",  DEFAULT_SL_PCT)),
+                            )
+                            strat_oos = apply_portfolio_sizing(
+                                strat_oos, sz_cfg, current_capital, _sz_mdl
+                            )
 
-                    is_metrics_df = pd.DataFrame(is_metrics)
-                    if not is_metrics_df.empty:
-                        asc = False if is_metrics_df['Higher_is_better'].all() else True
-                        is_metrics_df = is_metrics_df.sort_values(['Score','Net PnL IS'], ascending=[asc, False])
-                        selected_strategies, group_counts = [], {}
-                        for _, row in is_metrics_df.iterrows():
-                            if len(selected_strategies) >= _top_n: break
-                            grp = row['Group']
-                            if group_counts.get(grp, 0) < _mpg:
-                                selected_strategies.append(row)
-                                group_counts[grp] = group_counts.get(grp, 0) + 1
-                        for rank, strat_row in enumerate(selected_strategies):
-                            weight     = _fwp if rank < _fwc else _bwp
-                            strat_name = strat_row['Strategy']
-                            banned     = strat_row['Banned Days']
-                            historical_allocations.append({
-                                'OOS Start': current_oos_start, 'OOS End': current_oos_end,
-                                'Rank': rank + 1, 'Strategy': strat_name, 'Group': strat_row['Group'],
-                                'Score IS': round(strat_row['Score'], 4), 'Metric': _metric,
-                                'Weight': weight, 'Banned Days': banned,
-                                'Top-N': _top_n, 'Max Per Group': _mpg,
-                                'EC P80': strat_row['EC Thresholds']['dd_p80'] if _ec_en and strat_row['EC Thresholds'] else None,
-                                'EC P90': strat_row['EC Thresholds']['dd_p90'] if _ec_en and strat_row['EC Thresholds'] else None,
-                                'EC P95': strat_row['EC Thresholds']['dd_p95'] if _ec_en and strat_row['EC Thresholds'] else None,
-                            })
-                            strat_oos = oos_data[oos_data['Strategy'] == strat_name].copy()
-                            if not strat_oos.empty:
-                                strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned)]
-                                strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
+                        historical_allocations.append(strat_oos)
 
-                                # EC: applica modulation
-                                if _ec_en and strat_row['EC Thresholds'] is not None:
-                                    start_eq = ec_trailing_equity.get(strat_name, 0.0) if _ec_mode == "Trailing" else 0.0
-                                    strat_oos = apply_equity_control(
-                                        strat_oos,
-                                        thresholds=strat_row['EC Thresholds'],
-                                        capital_mode=_ec_mode,
-                                        start_equity=start_eq,
-                                    )
-                                    # Aggiorna trailing equity: deve usare sempre Net PnL puro
-                                    if _ec_mode == "Trailing":
-                                        ec_trailing_equity[strat_name] = start_eq + strat_oos['Net PnL'].sum()
+                    if _sz_en and _sz_comp and historical_allocations:
+                        window_realized = sum(
+                            t["Realized PnL $"].sum()
+                            for t in historical_allocations
+                            if "Realized PnL $" in t.columns
+                            and t["OOS Start"].iloc[0] == oos_start
+                        )
+                        current_capital = max(1_000.0, current_capital + window_realized)
+                        sizing_realized_by_window.append(window_realized)
 
-                                oos_results.append(strat_oos)
-                    current_oos_start = current_oos_end
+                if not historical_allocations:
+                    st.error("Nessun trade OOS generato.")
+                    st.stop()
 
-            if not oos_results:
-                st.error("Nessun trade OOS generato. Il dataset deve coprire almeno 13 mesi di storia.")
-            else:
-                final_oos_df = pd.concat(oos_results).sort_values('Date Closed').reset_index(drop=True)
-
-                # Colonna PnL attiva: EC se attivo, altrimenti Weighted Net PnL standard
-                _pnl_col = 'EC Weighted Net PnL' if (_ec_en and 'EC Weighted Net PnL' in final_oos_df.columns) else 'Weighted Net PnL'
+                final_oos_df = pd.concat(historical_allocations, ignore_index=True)
 
                 st.session_state["wfa_results"] = {
-                    "final_oos_df":   final_oos_df,
-                    "hist_alloc_df":  pd.DataFrame(historical_allocations),
-                    "exclusions_df":  pd.DataFrame(cusum_exclusions_log),
-                    "roc_filter_df":  pd.DataFrame(roc_filter_log),
-                    "ec_warnings_df": pd.DataFrame(ec_warnings_log),
-                    "ec_enabled":     _ec_en,
-                    "pnl_col":        _pnl_col,
-                    "params": {
-                        "top_n": _top_n, "full_weight_count": _fwc,
-                        "full_weight_pct": int(_fwp*100), "bench_weight_pct": int(_bwp*100),
-                        "max_per_group": _mpg, "ranking_metric": _metric,
-                        "roc_steps": _roc_s, "roc_filter_enabled": _roc_fe, "roc_filter_steps": _roc_fs,
-                        "ec_enabled": _ec_en, "ec_capital_mode": _ec_mode,
-                        "ec_p80": _ec_p80, "ec_p90": _ec_p90, "ec_p95": _ec_p95,
-                    }
+                    "final_oos_df":              final_oos_df,
+                    "windows":                   windows,
+                    "ec_enabled":                _ec_en,
+                    "sizing_enabled":            _sz_en,
+                    "sizing_initial_capital":    _sz_cap,
+                    "sizing_max_daily_loss_pct": _sz_mdl,
+                    "sizing_compounding":        _sz_comp,
+                    "sizing_final_capital":      current_capital,
+                    "sizing_realized_by_window": sizing_realized_by_window,
                 }
-                st.session_state.pop("wfa_detail_windows", None)
-                st.session_state.pop("wfa_detail_sig", None)
-                st.success("\u2705 Elaborazione completata!")
 
-        if st.session_state.get("wfa_results") is not None:
-            res           = st.session_state["wfa_results"]
-            final_oos_df  = res["final_oos_df"]
-            hist_alloc_df = res["hist_alloc_df"]
-            exclusions_df = res["exclusions_df"]
-            roc_filter_df = res.get("roc_filter_df", pd.DataFrame())
-            ec_warnings_df= res.get("ec_warnings_df", pd.DataFrame())
-            run_params    = res["params"]
-            _pnl_col      = res.get("pnl_col", "Weighted Net PnL")
-            _ec_active    = res.get("ec_enabled", False)
+        # ── OUTPUT ────────────────────────────────────────────────────────────
+        if "wfa_results" not in st.session_state:
+            st.info("Configura i parametri e premi ▶ Lancia simulazione WFA.")
+        else:
+            res            = st.session_state["wfa_results"]
+            final_oos_df   = res["final_oos_df"]
+            _ec_en_res     = res.get("ec_enabled", False)
+            _sz_en_res     = res.get("sizing_enabled", False)
 
-            st.header("1. Allocazione Corrente")
-            latest_start = hist_alloc_df['OOS Start'].max()
-            latest_end   = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start]['OOS End'].iloc[0]
-            today        = pd.Timestamp.today().normalize()
-            days_left    = (latest_end - today).days
+            pnl_col = "EC Weighted Net PnL" if _ec_en_res else "Weighted Net PnL"
 
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.info(f"\U0001f4c5 **Dal:** {latest_start.strftime('%d %b %Y')}")
-            c2.info(f"\U0001f51a **Fino al:** {latest_end.strftime('%d %b %Y')}")
-            if days_left > 0: c3.warning(f"\u23f3 **Rotazione tra:** {days_left}gg")
-            else:             c3.error("\U0001f504 **Rotazione scaduta**")
-            c4.info(f"\U0001f3c6 **Ranking:** {run_params['ranking_metric']}")
-            c5.info(f"\U0001f3db\ufe0f Top-N: **{run_params['top_n']}** | Max/gr: **{run_params['max_per_group']}**")
-            c6.info(f"\u2696\ufe0f **{run_params['full_weight_count']}\u00d7{run_params['full_weight_pct']}%** + **{run_params['top_n']-run_params['full_weight_count']}\u00d7{run_params['bench_weight_pct']}%**")
+            # ── Sezione 1: Allocazione corrente ──────────────────────────────
+            st.markdown("## 📋 Allocazione Corrente")
+            latest_window_end = final_oos_df["OOS End"].max()
+            latest_alloc = final_oos_df[final_oos_df["OOS End"] == latest_window_end].copy()
+            latest_alloc = latest_alloc.drop_duplicates(subset=["Strategy"])
 
-            if _ec_active:
-                st.info(
-                    f"\U0001f4c9 **Equity Control attivo** \u2014 Modalita: **{run_params['ec_capital_mode']}** "
-                    f"| Soglie DD IS: P{run_params['ec_p80']} / P{run_params['ec_p90']} / P{run_params['ec_p95']} "
-                    f"| PnL visualizzato: `EC Weighted Net PnL`"
-                )
+            display_cols = ["Strategy", "Rank", "Weight", "RiskFactor"]
+            if _sz_en_res and "Contracts" in latest_alloc.columns:
+                display_cols += ["Contracts", "Risk $"]
+            st.dataframe(latest_alloc[display_cols].reset_index(drop=True), use_container_width=True)
 
-            latest_alloc = hist_alloc_df[hist_alloc_df['OOS Start'] == latest_start].copy()
-            disp_cols = ['Rank','Strategy','Group','Score IS','Metric','Weight','Banned Days']
-            if _ec_active and 'EC P80' in latest_alloc.columns:
-                disp_cols += ['EC P80', 'EC P90', 'EC P95']
-            disp = latest_alloc[disp_cols].copy()
-            disp.rename(columns={'Score IS': f"Score IS ({run_params['ranking_metric']})", 'Metric': 'Metrica'}, inplace=True)
-            disp['Weight'] = (disp['Weight'] * 100).round(0).astype(int).astype(str) + '%'
-            disp['Giorni Spenti (CUSUM)'] = disp['Banned Days'].apply(format_banned_days)
-            disp.drop(columns=['Banned Days', 'Metrica'], inplace=True)
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            # ── Sezione 2: Metriche OOS ───────────────────────────────────────
+            st.markdown("## 📊 Metriche OOS")
+            tab_labels = ["Weighted PnL"]
+            if _ec_en_res:
+                tab_labels.append("EC Weighted PnL")
+            if _sz_en_res and "Realized PnL $" in final_oos_df.columns:
+                tab_labels.append("Realized PnL $")
 
-            _show_logs = []
-            if not exclusions_df.empty:
-                latest_excl = exclusions_df[exclusions_df['OOS Start'] == latest_start]
-                if not latest_excl.empty: _show_logs.append(("CUSUM", latest_excl))
-            if not roc_filter_df.empty:
-                latest_roc_excl = roc_filter_df[roc_filter_df['OOS Start'] == latest_start]
-                if not latest_roc_excl.empty: _show_logs.append(("ROC filter", latest_roc_excl))
-            if _ec_active and not ec_warnings_df.empty:
-                latest_ec_warn = ec_warnings_df[ec_warnings_df['OOS Start'] == latest_start]
-                if not latest_ec_warn.empty: _show_logs.append(("EC affidabilita IS", latest_ec_warn))
-            for log_label, log_df in _show_logs:
-                st.warning(f"\u26a0\ufe0f Strategie escluse/avvisi ({log_label}):")
-                st.dataframe(log_df[['Strategy', log_df.columns[-1]]], use_container_width=True, hide_index=True)
+            metrics_tabs = st.tabs(tab_labels)
+            with metrics_tabs[0]:
+                render_metrics(calculate_metrics(final_oos_df, "Weighted Net PnL"), "Weighted Net PnL")
+            tab_idx = 1
+            if _ec_en_res:
+                with metrics_tabs[tab_idx]:
+                    render_metrics(calculate_metrics(final_oos_df, "EC Weighted Net PnL"), "EC Weighted Net PnL")
+                tab_idx += 1
+            if _sz_en_res and "Realized PnL $" in final_oos_df.columns:
+                with metrics_tabs[tab_idx]:
+                    render_metrics(calculate_metrics(final_oos_df, "Realized PnL $"), "Realized PnL $")
 
-            st.header("2. Metriche Out-Of-Sample")
-            tab_global, tab_recent = st.tabs(["\U0001f4ca Storico Completo OOS", "\U0001f4c8 Dal 1\u00b0 Settembre 2025"])
-            with tab_global:
-                render_metrics(calculate_metrics(final_oos_df, _pnl_col), "Metriche \u2014 Storico Completo OOS")
-            with tab_recent:
-                recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
-                render_metrics(calculate_metrics(recent_df, _pnl_col), "Metriche \u2014 Dal 1\u00b0 Settembre 2025")
+            # ── Sezione 3: Curva equity ───────────────────────────────────────
+            st.markdown("## 📈 Curva Equity OOS")
+            daily_pnl = final_oos_df.groupby(final_oos_df["Date Closed"].dt.date)[pnl_col].sum()
+            cum_pnl   = daily_pnl.cumsum()
 
-            equity_label = "EC Weighted Net PnL" if _ec_active else "Weighted Net PnL"
-
-            st.header("3. Curva Equity \u2014 Storico Completo OOS")
-            all_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)[_pnl_col].sum()
-            all_cum   = all_daily.cumsum()
-            fig_all = go.Figure()
-            fig_all.add_trace(go.Scatter(
-                x=all_cum.index, y=all_cum.values, mode='lines', fill='tozeroy',
-                line=dict(color='#00d4ff', width=2), fillcolor='rgba(0,212,255,0.08)',
-                name=equity_label,
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(cum_pnl.index), y=list(cum_pnl.values),
+                mode="lines", name=pnl_col,
+                line=dict(color="#00d4ff", width=2),
             ))
-            # Se EC attivo, aggiungi anche la curva senza EC per confronto
-            if _ec_active and 'Weighted Net PnL' in final_oos_df.columns:
-                base_daily = final_oos_df.groupby(final_oos_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
-                base_cum   = base_daily.cumsum()
-                fig_all.add_trace(go.Scatter(
-                    x=base_cum.index, y=base_cum.values, mode='lines',
-                    line=dict(color='#7a9abf', width=1.5, dash='dot'),
-                    name='Senza EC', opacity=0.6,
+
+            if _sz_en_res and "Realized PnL $" in final_oos_df.columns:
+                daily_real = final_oos_df.groupby(final_oos_df["Date Closed"].dt.date)["Realized PnL $"].sum()
+                cum_real   = daily_real.cumsum()
+                fig.add_trace(go.Scatter(
+                    x=list(cum_real.index), y=list(cum_real.values),
+                    mode="lines", name="Realized PnL $",
+                    line=dict(color="#22c55e", width=2, dash="dot"),
                 ))
-            fig_all.update_layout(title="Equity Cumulativa WFA \u2014 Storico Completo",
-                xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
-            st.plotly_chart(fig_all, use_container_width=True)
 
-            st.header("4. Curva Equity \u2014 Dal 1\u00b0 Settembre 2025")
-            recent_df = final_oos_df[final_oos_df['Date Closed'] >= pd.to_datetime('2025-09-01')].copy()
-            if not recent_df.empty:
-                rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)[_pnl_col].sum()
-                rec_cum   = rec_daily.cumsum()
-                fig_rec = go.Figure()
-                fig_rec.add_trace(go.Scatter(
-                    x=rec_cum.index, y=rec_cum.values, mode='lines', fill='tozeroy',
-                    line=dict(color='#f59e0b', width=2), fillcolor='rgba(245,158,11,0.08)',
-                    name=equity_label,
-                ))
-                if _ec_active and 'Weighted Net PnL' in recent_df.columns:
-                    base_rec_daily = recent_df.groupby(recent_df['Date Closed'].dt.date)['Weighted Net PnL'].sum()
-                    base_rec_cum   = base_rec_daily.cumsum()
-                    fig_rec.add_trace(go.Scatter(
-                        x=base_rec_cum.index, y=base_rec_cum.values, mode='lines',
-                        line=dict(color='#7a9abf', width=1.5, dash='dot'),
-                        name='Senza EC', opacity=0.6,
-                    ))
-                fig_rec.update_layout(title="Equity Cumulativa WFA \u2014 Dal 1\u00b0 Settembre 2025",
-                    xaxis_title="Data", yaxis_title="Net PnL ($)", **OZONE_LAYOUT)
-                st.plotly_chart(fig_rec, use_container_width=True)
-            else:
-                st.info("Nessun dato OOS disponibile dal 1\u00b0 settembre 2025.")
+            fig.update_layout(
+                **OZONE_LAYOUT,
+                title="Equity Curve OOS",
+                xaxis_title="Data",
+                yaxis_title="PnL cumulativo ($)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-            st.header("5. Esporta Dati")
-            hist_export = hist_alloc_df.copy()
-            hist_export['Banned Days'] = hist_export['Banned Days'].apply(
-                lambda x: format_banned_days(x) if isinstance(x, list) else x)
-            equity_csv_df = pd.DataFrame({
-                'Date': all_cum.index, 'Daily PnL': all_daily.values, 'Cumulative PnL': all_cum.values})
+            # ── Sezione 4: Storico allocazioni ────────────────────────────────
+            st.markdown("## 🗂️ Storico Allocazioni OOS")
+            show_cols = ["Date Closed", "Strategy", "Net PnL", "Weighted Net PnL", "Weight", "Rank",
+                         "IS Start", "OOS Start", "OOS End"]
+            if _ec_en_res:
+                show_cols += ["RiskFactor", "EC Weighted Net PnL", "EC Tracking Equity"]
+            if _sz_en_res and "Contracts" in final_oos_df.columns:
+                show_cols += ["Contracts", "Risk $", "Realized PnL $"]
+            show_cols = [c for c in show_cols if c in final_oos_df.columns]
+            st.dataframe(final_oos_df[show_cols].reset_index(drop=True), use_container_width=True)
 
-            col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
-            with col_b1:
-                st.download_button("\U0001f4e5 Allocazioni Storiche",
-                    data=hist_export.to_csv(index=False).encode('utf-8'), file_name="wfa_allocations.csv", mime="text/csv")
-            with col_b2:
-                st.download_button("\U0001f4e5 Trade OOS Filtrati",
-                    data=final_oos_df.to_csv(index=False).encode('utf-8'), file_name="wfa_oos_trades.csv", mime="text/csv")
-            with col_b3:
-                st.download_button("\U0001f4e5 Equity Line Completa",
-                    data=equity_csv_df.to_csv(index=False).encode('utf-8'), file_name="equity_full.csv", mime="text/csv")
-            with col_b4:
-                if not recent_df.empty:
-                    rec_equity_csv = pd.DataFrame({
-                        'Date': rec_cum.index, 'Daily PnL': rec_daily.values, 'Cumulative PnL': rec_cum.values})
-                    st.download_button("\U0001f4e5 Equity Line Set 2025+",
-                        data=rec_equity_csv.to_csv(index=False).encode('utf-8'), file_name="equity_sep2025.csv", mime="text/csv")
-            with col_b5:
-                combined_excl = pd.concat([exclusions_df, roc_filter_df]).reset_index(drop=True) \
-                    if not roc_filter_df.empty else exclusions_df
-                if not combined_excl.empty:
-                    combined_excl['OOS Start'] = combined_excl['OOS Start'].astype(str)
-                    st.download_button("\U0001f4e5 Log Esclusioni",
-                        data=combined_excl.to_csv(index=False).encode('utf-8'), file_name="wfa_exclusions.csv", mime="text/csv")
-
-            # ─── SEZIONE 6: DETTAGLIO COMBINAZIONE WFA ────────────────────────
-            st.header("6. Dettaglio Combinazione WFA")
-            st.caption(
-                "Analisi per singola finestra OOS dei parametri attualmente in uso: "
-                "distribuzione del Profit Factor, PnL finestra per finestra e frequenza delle strategie selezionate."
+            # ── Sezione 5: Export ──────────────────────────────────────────────
+            st.markdown("## 💾 Esporta Dati")
+            export_cols = show_cols
+            csv_bytes = final_oos_df[export_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="⬇️ Scarica CSV OOS completo",
+                data=csv_bytes,
+                file_name="wfa_oos_results.csv",
+                mime="text/csv",
             )
 
-            _wfa_params_detail = WFAParams(
-                top_n=run_params["top_n"],
-                full_weight_count=run_params["full_weight_count"],
-                full_weight_pct=float(run_params["full_weight_pct"]),
-                bench_weight_pct=float(run_params["bench_weight_pct"]),
-                max_per_group=run_params["max_per_group"],
-                ranking_metric=run_params["ranking_metric"],
-                roc_filter_enabled=run_params["roc_filter_enabled"],
-                roc_filter_steps=run_params["roc_filter_steps"],
-            )
-
-            _detail_cache_key = "wfa_detail_windows"
-            _detail_sig_key   = "wfa_detail_sig"
-            _current_sig = (
-                run_params["top_n"], run_params["full_weight_count"],
-                run_params["full_weight_pct"], run_params["bench_weight_pct"],
-                run_params["max_per_group"], run_params["ranking_metric"],
-                run_params["roc_filter_enabled"], run_params["roc_filter_steps"],
-            )
-
-            if (
-                _detail_cache_key not in st.session_state
-                or st.session_state.get(_detail_sig_key) != _current_sig
-            ):
-                with st.spinner("Calcolo finestre OOS per il dettaglio..."):
-                    _df_for_detail = df_raw.copy()
-                    _df_for_detail["Date Opened"] = pd.to_datetime(_df_for_detail["Date Opened"])
-                    _df_for_detail["Date Closed"] = pd.to_datetime(_df_for_detail["Date Closed"])
-                    _df_for_detail["weekday_open"] = _df_for_detail["Date Opened"].dt.weekday
-                    _df_for_detail["P/L"] = _df_for_detail["P/L"].apply(clean_money)
-                    _df_for_detail["Opening Commissions + Fees"] = _df_for_detail["Opening Commissions + Fees"].fillna(0).apply(clean_money)
-                    _df_for_detail["Closing Commissions + Fees"] = _df_for_detail["Closing Commissions + Fees"].fillna(0).apply(clean_money)
-                    _df_for_detail["Net PnL"] = (
-                        _df_for_detail["P/L"]
-                        - _df_for_detail["Opening Commissions + Fees"]
-                        - _df_for_detail["Closing Commissions + Fees"]
-                    )
-                    _df_for_detail = _df_for_detail.sort_values("Date Closed").reset_index(drop=True)
-
-                    _windows_detail = run_wfa_single_windowed(
-                        df=_df_for_detail,
-                        params=_wfa_params_detail,
-                        group_map=strategy_mapping,
-                        date_col="Date Closed",
-                        strategy_col="Strategy",
-                        pnl_col="Net PnL",
-                    )
-                st.session_state[_detail_cache_key] = _windows_detail
-                st.session_state[_detail_sig_key]   = _current_sig
-            else:
-                _windows_detail = st.session_state[_detail_cache_key]
-
-            if not _windows_detail:
-                st.warning("Nessuna finestra OOS disponibile per il dettaglio.")
-            else:
-                _n_win = len(_windows_detail)
-
-                st.markdown("#### \U0001f3af Box Plot PF per finestra OOS")
-                _pf_vals = [w["pf"] for w in _windows_detail]
-                _rng = np.random.default_rng(42)
-                _jitter_x     = _rng.uniform(-0.25, 0.25, size=len(_pf_vals)).tolist()
-                _point_colors = ["#6ee7b7" if v >= 1.0 else "#f87171" for v in _pf_vals]
-                _hover_texts  = [f"Finestra {i+1}<br>PF: {v:.2f}" for i, v in enumerate(_pf_vals)]
-
-                fig_wfa_box = go.Figure()
-                fig_wfa_box.add_trace(go.Box(
-                    y=_pf_vals, x=[0] * len(_pf_vals),
-                    name="PF per finestra",
-                    marker_color="#4f98a3", line_color="#4f98a3",
-                    fillcolor="rgba(79,152,163,0.25)",
-                    boxpoints=False, showlegend=False, hoverinfo="skip",
-                ))
-                fig_wfa_box.add_trace(go.Scatter(
-                    x=_jitter_x, y=_pf_vals, mode="markers",
-                    marker=dict(size=8, color=_point_colors,
-                                line=dict(color="#0d1117", width=1), opacity=0.9),
-                    text=_hover_texts,
-                    hovertemplate="%{text}<extra></extra>",
-                    showlegend=False, name="Punti",
-                ))
-                fig_wfa_box.add_hline(
-                    y=1.0, line_dash="dash", line_color="#ef4444", line_width=1.5,
-                    annotation_text="PF = 1.0",
-                    annotation_position="bottom right",
-                    annotation_font=dict(color="#ef4444", size=10),
+            if _sz_en_res:
+                st.markdown(
+                    f"**Capitale finale:** ${res.get('sizing_final_capital', _sz_cap):,.2f} "
+                    f"({'compounding attivo' if res.get('sizing_compounding') else 'nessun compounding'})"
                 )
-                fig_wfa_box.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#131920",
-                    font=dict(color="#e0eaf4"),
-                    xaxis=dict(showticklabels=False, zeroline=False, showgrid=False, range=[-1, 1]),
-                    yaxis=dict(title="Profit Factor", gridcolor="#1e2a35"),
-                    height=360, margin=dict(l=60, r=40, t=40, b=40), showlegend=False,
-                    title=dict(
-                        text=f"Distribuzione PF \u2014 {_n_win} finestre OOS",
-                        font=dict(size=13, color="#e0eaf4"), x=0.02,
-                    ),
-                )
-                st.plotly_chart(fig_wfa_box, use_container_width=True)
 
-                st.markdown("#### \U0001f4c5 PnL per finestra OOS")
-                st.caption("Verde = finestra profittevole \u00b7 Rosso = finestra in perdita \u00b7 Linea tratteggiata = break-even.")
-
-                _win_labels = [f"W{w['window']}\n{w['start_oos'][:7]}" for w in _windows_detail]
-                _win_pnl    = [w["total_pnl"] for w in _windows_detail]
-                _win_pf     = [w["pf"] for w in _windows_detail]
-                _win_start  = [w["start_oos"] for w in _windows_detail]
-                _win_end    = [w["end_oos"] for w in _windows_detail]
-                _bar_colors = ["#6ee7b7" if v > 0 else "#f87171" for v in _win_pnl]
-
-                fig_wfa_pnl = go.Figure()
-                fig_wfa_pnl.add_trace(go.Bar(
-                    x=_win_labels, y=_win_pnl,
-                    marker_color=_bar_colors,
-                    marker_line=dict(color="#0d1117", width=0.8),
-                    customdata=list(zip(_win_start, _win_end, _win_pf)),
-                    hovertemplate=(
-                        "<b>Finestra %{x}</b><br>"
-                        "Dal %{customdata[0]} al %{customdata[1]}<br>"
-                        "<b>PnL:</b> $%{y:,.2f}<br>"
-                        "<b>PF:</b> %{customdata[2]:.2f}<br>"
-                        "<extra></extra>"
-                    ),
-                    showlegend=False,
-                ))
-                fig_wfa_pnl.add_hline(y=0, line_dash="dash", line_color="#9ca3af", line_width=1.2)
-                fig_wfa_pnl.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#131920",
-                    font=dict(color="#e0eaf4"),
-                    xaxis=dict(title="Finestra OOS", gridcolor="#1e2a35",
-                               tickangle=-45 if len(_win_labels) > 8 else 0),
-                    yaxis=dict(title="Total PnL ($)", gridcolor="#1e2a35",
-                               tickprefix="$", separatethousands=True, zeroline=False),
-                    height=320, margin=dict(l=70, r=40, t=30, b=60), bargap=0.25,
-                )
-                st.plotly_chart(fig_wfa_pnl, use_container_width=True)
-
-                _all_selected = []
-                for _w in _windows_detail:
-                    _all_selected.extend(_w.get("selected_strategies", []))
-
-                if _all_selected:
-                    st.markdown("#### \U0001f9e9 Frequenza strategie nelle finestre OOS")
-                    st.caption(
-                        "Quante finestre OOS ha coperto ogni strategia selezionata in IS. "
-                        "Barre pi\u00f9 chiare = presente in meno del 50% delle finestre."
-                    )
-                    _freq         = Counter(_all_selected)
-                    _strat_names  = [s for s, _ in _freq.most_common()]
-                    _strat_counts = [_freq[s] for s in _strat_names]
-                    _strat_pcts   = [_freq[s] / _n_win * 100 for s in _strat_names]
-                    _bar_colors_s = [
-                        "#4f98a3" if (_freq[s] / _n_win) >= 0.5 else "#2a5560"
-                        for s in _strat_names
-                    ]
-
-                    fig_wfa_freq = go.Figure()
-                    fig_wfa_freq.add_trace(go.Bar(
-                        x=_strat_counts, y=_strat_names, orientation="h",
-                        marker_color=_bar_colors_s,
-                        marker_line=dict(color="#0d1117", width=0.6),
-                        text=[f"{p:.0f}%" for p in _strat_pcts],
-                        textposition="outside",
-                        textfont=dict(color="#e0eaf4", size=11),
-                        customdata=_strat_pcts,
-                        hovertemplate=(
-                            "<b>%{y}</b><br>"
-                            "Presente in <b>%{x}</b> finestre su " + str(_n_win) + "<br>"
-                            "Frequenza: <b>%{customdata:.1f}%</b><br>"
-                            "<extra></extra>"
-                        ),
-                        showlegend=False,
-                    ))
-                    fig_wfa_freq.update_layout(
-                        template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#131920",
-                        font=dict(color="#e0eaf4"),
-                        xaxis=dict(title="N\u00b0 finestre OOS", gridcolor="#1e2a35",
-                                   range=[0, _n_win * 1.18], zeroline=False),
-                        yaxis=dict(title="", gridcolor="#1e2a35", automargin=True),
-                        height=max(260, len(_strat_names) * 28 + 80),
-                        margin=dict(l=20, r=80, t=30, b=50), bargap=0.3,
-                    )
-                    st.plotly_chart(fig_wfa_freq, use_container_width=True)
-                else:
-                    st.caption(
-                        "\u2139\ufe0f Dati `selected_strategies` non disponibili per questa run. "
-                        "Riesegui la simulazione WFA per visualizzare il grafico."
-                    )
-
-    # ─── TAB OTTIMIZZATORE ────────────────────────────────────────────────────
     with tab_opt:
-        df_opt = df_raw.copy()
-        df_opt['Date Closed'] = pd.to_datetime(df_opt['Date Closed'])
-        df_opt['Date Opened'] = pd.to_datetime(df_opt['Date Opened'])
-        df_opt['P/L'] = df_opt['P/L'].apply(clean_money)
-        df_opt['Opening Commissions + Fees'] = df_opt['Opening Commissions + Fees'].fillna(0).apply(clean_money)
-        df_opt['Closing Commissions + Fees'] = df_opt['Closing Commissions + Fees'].fillna(0).apply(clean_money)
-        df_opt['Net PnL'] = (
-            df_opt['P/L']
-            - df_opt['Opening Commissions + Fees']
-            - df_opt['Closing Commissions + Fees']
-        )
-        df_opt['weekday_open'] = df_opt['Date Opened'].dt.weekday
-        df_opt = df_opt.sort_values('Date Closed').reset_index(drop=True)
-
-        render_optimizer_tab(
-            df_processed=df_opt,
-            group_map=st.session_state['strategy_mapping'],
-            date_col='Date Closed',
-            strategy_col='Strategy',
-            pnl_col='Net PnL',
-        )
+        render_optimizer_tab(df_raw, strategy_mapping)
