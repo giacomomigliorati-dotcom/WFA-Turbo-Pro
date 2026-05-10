@@ -350,16 +350,58 @@ for _k, _v in _SS_DEFAULTS.items():
 # ─── UPLOAD CSV ───────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Carica il dataset dei trade (CSV)", type=['csv'])
 
+# ─── NORMALIZZAZIONE COLONNA Net PnL ─────────────────────────────────────────
+# Mappa i nomi alternativi più comuni al nome canonico 'Net PnL'
+_NET_PNL_ALIASES = {
+    'net pnl': 'Net PnL',
+    'netpnl': 'Net PnL',
+    'net p&l': 'Net PnL',
+    'netp&l': 'Net PnL',
+    'net pl': 'Net PnL',
+    'netpl': 'Net PnL',
+    'net profit': 'Net PnL',
+    'net profit/loss': 'Net PnL',
+    'pnl': 'Net PnL',
+    'p&l': 'Net PnL',
+}
+
+def _normalize_net_pnl_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Rinomina la colonna Net PnL se presente con un nome alternativo."""
+    if 'Net PnL' in df.columns:
+        return df
+    col_lookup = {c.strip().lower().replace(' ', '').replace('&', '&'): c for c in df.columns}
+    col_lookup_stripped = {c.strip().lower(): c for c in df.columns}
+    for alias, canonical in _NET_PNL_ALIASES.items():
+        # check with spaces
+        if alias in col_lookup_stripped:
+            return df.rename(columns={col_lookup_stripped[alias]: canonical})
+        # check without spaces
+        alias_nospace = alias.replace(' ', '')
+        for orig_nospace, orig_col in {c.strip().lower().replace(' ', ''): c for c in df.columns}.items():
+            if orig_nospace == alias_nospace:
+                return df.rename(columns={orig_col: canonical})
+    return df
+
 @st.cache_data(show_spinner=False)
 def preprocess_df(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = df.columns.str.strip()
+    df = _normalize_net_pnl_column(df)
+    if 'Net PnL' not in df.columns:
+        raise ValueError(
+            f"Colonna 'Net PnL' non trovata nel CSV. "
+            f"Colonne disponibili: {list(df.columns)}"
+        )
     df = df[~df['Strategy'].astype(str).str.contains('Legendary', na=False, case=False)].copy()
     return df
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.getvalue()
-    df_raw = preprocess_df(file_bytes)
+    try:
+        df_raw = preprocess_df(file_bytes)
+    except ValueError as _e:
+        st.error(f"❌ Errore nel CSV caricato: {_e}")
+        st.stop()
     all_strategies_in_file = sorted(df_raw['Strategy'].dropna().unique().tolist())
 
     if 'strategy_mapping' not in st.session_state:
