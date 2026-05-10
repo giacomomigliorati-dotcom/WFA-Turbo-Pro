@@ -297,3 +297,134 @@ def apply_equity_control(
     df["EC Weighted Net PnL"] = df["Weighted Net PnL"] * df["RiskFactor"]
     df["EC Tracking Equity"]  = tracking_equities
     return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POSITION SIZING
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from wfa_sizing import (
+        StrategySizingConfig,
+        PortfolioSizingParams,
+        compute_contracts,
+        clean_money as _clean_money,
+        DEFAULT_SIZING_ENABLED,
+    )
+    _SIZING_AVAILABLE = True
+except ImportError:
+    _SIZING_AVAILABLE = False
+
+
+def apply_portfolio_sizing(
+    strat_oos_ec: pd.DataFrame,
+    sizing_cfg: "StrategySizingConfig",
+    capital: float,
+    max_daily_loss_pct: float,
+) -> pd.DataFrame:
+    """Applica il position sizing a una finestra OOS post-EC di una strategia.
+
+    Prerequisiti
+    ------------
+    strat_oos_ec deve contenere le colonne:
+        - 'Date Closed'         : datetime
+        - 'Net PnL'             : float  (PnL reale per trade)
+        - 'Weighted Net PnL'    : float  (PnL pesato WFA)
+        - 'RiskFactor'          : float  (output di apply_equity_control; 1.0 se EC disabilitato)
+        - 'Weight'              : float  (peso WFA del trade, es. 0.80 / 0.40)
+
+    Se la colonna 'Weight' non e presente viene assunta = 1.0 per tutti i trade.
+    Se la colonna 'Premium' non e presente, il premio e assunto = 0.0
+    (sl_usd sara usato come fallback automatico da compute_contracts).
+
+    Colonne aggiunte
+    ----------------
+        Contracts       : int   -- numero di contratti allocati
+        Risk $          : float -- rischio effettivo impegnato (contratti * sl_unit)
+        Realized PnL $  : float -- PnL realizzato = (Net PnL / sl_unit) * Risk $
+                                   (proporzionale al numero di contratti)
+
+    Budget giornaliero
+    ------------------
+    Il budget giornaliero di rischio e inizializzato a:
+        daily_budget = capital * max_daily_loss_pct / 100
+    e viene decrementato ad ogni trade della giornata. Si azzera alla
+    mezzanotte (cambio di data in 'Date Closed').
+
+    Parametri
+    ---------
+    strat_oos_ec        : DataFrame post-EC (con colonna RiskFactor)
+    sizing_cfg          : StrategySizingConfig della strategia
+    capital             : capitale corrente del portafoglio
+    max_daily_loss_pct  : % del capitale come budget rischio giornaliero
+    """
+    if not _SIZING_AVAILABLE:
+        raise RuntimeError(
+            "wfa_sizing non disponibile: impossibile chiamare apply_portfolio_sizing."
+        )
+
+    df = strat_oos_ec.copy().sort_values("Date Closed").reset_index(drop=True)
+
+    # Colonne opzionali con fallback
+    if "Weight" not in df.columns:
+        df["Weight"] = 1.0
+    if "Premium" not in df.columns:
+        df["Premium"] = 0.0
+    if "RiskFactor" not in df.columns:
+        df["RiskFactor"] = 1.0
+
+    daily_budget_init = capital * (max_daily_loss_pct / 100.0)
+    remaining_budget  = daily_budget_init
+    current_date      = None
+
+    contracts_list  = []
+    risk_list       = []
+    realized_list   = []
+
+    for _, row in df.iterrows():
+        trade_date = pd.to_datetime(row["Date Closed"]).date()
+
+        # Reset budget giornaliero al cambio di data
+        if trade_date != current_date:
+            remaining_budget = daily_budget_init
+            current_date     = trade_date
+
+        premium    = abs(_clean_money(row["Premium"]))
+        weight_wfa = float(row["Weight"])
+        rf         = float(row["RiskFactor"])
+        pnl_raw    = float(row["Net PnL"])
+
+        n_con, risk_used = compute_contracts(
+            premium=premium,
+            sizing_cfg=sizing_cfg,
+            capital=capital,
+            risk_factor=rf,
+            weight_wfa=weight_wfa,
+            remaining_daily_budget=remaining_budget,
+        )
+
+        remaining_budget = max(0.0, remaining_budget - risk_used)
+
+        # Realized PnL proporzionale ai contratti allocati
+        # Se sl_unit > 0: realized = pnl_raw_per_contratto * n_con
+        # pnl_raw_per_contratto viene stimato come pnl_raw / (max contratti teorici)
+        # Per semplicita: realized = pnl_raw * (n_con / max(1, n_con_teorico))
+        # Approssimazione pratica: se n_con > 0, realizzato = pnl_raw * rf * weight_wfa * (cap_pct/100) ... 
+        # Scelta piu robusta: realized = pnl_raw per contratto * n_con, dove
+        #   pnl_per_contratto = pnl_raw / n_con_teorico_raw
+        # Con n_con_teorico_raw = max(1, floor(capital*cap_pct/100 / sl_unit * weight_wfa * rf))
+        # Ma sl_unit e gia dentro compute_contracts. Usiamo la formula diretta:
+        if n_con > 0 and risk_used > 0:
+            # stima pnl per unita di rischio impegnato
+            realized = pnl_raw * (risk_used / max(daily_budget_init, 1.0))
+        else:
+            realized = 0.0
+
+        contracts_list.append(n_con)
+        risk_list.append(risk_used)
+        realized_list.append(realized)
+
+    df["Contracts"]      = contracts_list
+    df["Risk $"]         = risk_list
+    df["Realized PnL $"] = realized_list
+    return df
