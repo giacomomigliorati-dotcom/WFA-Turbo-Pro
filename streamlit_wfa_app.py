@@ -365,22 +365,59 @@ _NET_PNL_ALIASES = {
     'p&l': 'Net PnL',
 }
 
+# Colonne commissioni supportate (in ordine di priorità)
+_COMMISSION_COLS = [
+    'Opening Commissions + Fees',
+    'Closing Commissions + Fees',
+    'Commissions + Fees',
+    'Commission',
+    'Fees',
+]
+
+# Colonne P/L grezzo supportate (in ordine di priorità)
+_PL_RAW_COLS = [
+    'P/L',
+    'P/L $',
+    'Gross P/L',
+    'Gross PnL',
+    'Profit/Loss',
+]
+
+
 def _normalize_net_pnl_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Rinomina la colonna Net PnL se presente con un nome alternativo."""
+    """Rinomina o calcola la colonna Net PnL.
+
+    Logica (in ordine):
+    1. Se 'Net PnL' esiste già → nessuna modifica.
+    2. Se un alias diretto esiste (es. 'P&L') → rinomina.
+    3. Se esiste una colonna P/L grezza → calcola Net PnL sottraendo le commissioni.
+    """
     if 'Net PnL' in df.columns:
         return df
-    col_lookup = {c.strip().lower().replace(' ', '').replace('&', '&'): c for c in df.columns}
-    col_lookup_stripped = {c.strip().lower(): c for c in df.columns}
+
+    # --- tentativo 1: alias diretti ---
+    col_lower_map = {c.strip().lower(): c for c in df.columns}
+    col_nospace_map = {c.strip().lower().replace(' ', ''): c for c in df.columns}
     for alias, canonical in _NET_PNL_ALIASES.items():
-        # check with spaces
-        if alias in col_lookup_stripped:
-            return df.rename(columns={col_lookup_stripped[alias]: canonical})
-        # check without spaces
+        if alias in col_lower_map:
+            return df.rename(columns={col_lower_map[alias]: canonical})
         alias_nospace = alias.replace(' ', '')
-        for orig_nospace, orig_col in {c.strip().lower().replace(' ', ''): c for c in df.columns}.items():
-            if orig_nospace == alias_nospace:
-                return df.rename(columns={orig_col: canonical})
+        if alias_nospace in col_nospace_map:
+            return df.rename(columns={col_nospace_map[alias_nospace]: canonical})
+
+    # --- tentativo 2: P/L grezzo - commissioni ---
+    pl_col = next((c for c in _PL_RAW_COLS if c in df.columns), None)
+    if pl_col is not None:
+        df = df.copy()
+        net = df[pl_col].apply(clean_money)
+        for comm_col in _COMMISSION_COLS:
+            if comm_col in df.columns:
+                net = net - df[comm_col].apply(clean_money).abs()
+        df['Net PnL'] = net
+        return df
+
     return df
+
 
 @st.cache_data(show_spinner=False)
 def preprocess_df(file_bytes: bytes) -> pd.DataFrame:
