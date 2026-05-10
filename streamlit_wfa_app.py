@@ -49,7 +49,7 @@ from wfa_optimizer_module import render_optimizer_tab, run_wfa_single_windowed, 
 
 st.set_page_config(page_title="Texano's Walk Forward", layout="wide")
 
-# ─── OZONE THEME CSS ─────────────────────────────────────────────────────────
+# ─── OZONE THEME CSS ──────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -109,7 +109,7 @@ h3{ color:#7dd3fc!important; font-weight:500!important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── TITOLO ────────────────────────────────────────────────────────────────
+# ─── TITOLO ────────────────────────────────────────────────────────────────────────────
 col_title, col_help = st.columns([10, 1])
 with col_title:
     st.title("Texano's Walk Forward")
@@ -165,7 +165,7 @@ Le strategie in panchina con RiskFactor EC ≤ 0.50 vengono escluse dall'allocaz
 2. Al prossimo accesso: **📥 Importa** → **✅ Applica**
         """)
 
-# ─── COSTANTI LOCALI ────────────────────────────────────────────────────────────────
+# ─── COSTANTI LOCALI ──────────────────────────────────────────────────────────────────────────────────
 DEFAULT_GROUP_MAPPING = {
     'Condor ZM+': 'Iron Condor',
     'TEST - Iron Condor delle 20:00': 'Iron Condor',
@@ -195,7 +195,7 @@ OZONE_LAYOUT = dict(
     margin=dict(l=50, r=30, t=60, b=50),
 )
 
-# ─── FUNZIONI CORE GENERALI ───────────────────────────────────────────────────
+# ─── FUNZIONI CORE GENERALI ──────────────────────────────────────────────────────────────────────────────────
 def calculate_metrics(df, pnl_col='Weighted Net PnL'):
     if df.empty: return {}
     pnl = df[pnl_col]
@@ -250,7 +250,7 @@ def render_metrics(m, label):
     r4[1].metric("Best Day",      f"${m['Best Day ($)']:,.2f}")
     r4[2].metric("Worst Day",     f"${m['Worst Day ($)']:,.2f}")
 
-# ─── FUNZIONI JSON CONFIG ─────────────────────────────────────────────────────
+# ─── FUNZIONI JSON CONFIG ─────────────────────────────────────────────────────────────────────────────────
 def build_config_payload():
     return {
         "version": 5,
@@ -314,7 +314,7 @@ def apply_config_payload(payload, all_strategies):
     raw_cfgs = payload.get("sizing_strategy_configs", {})
     st.session_state["sizing_strategy_configs"] = raw_cfgs if isinstance(raw_cfgs, dict) else {}
 
-# ─── INIT SESSION STATE ───────────────────────────────────────────────────────
+# ─── INIT SESSION STATE ────────────────────────────────────────────────────────────────────────────────
 _SS_DEFAULTS = {
     "top_n":              DEFAULT_TOP_N,
     "full_weight_count":  DEFAULT_FULL_WEIGHT_COUNT,
@@ -340,10 +340,10 @@ for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-# ─── UPLOAD CSV ───────────────────────────────────────────────────────────────
+# ─── UPLOAD CSV ───────────────────────────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Carica il dataset dei trade (CSV)", type=['csv'])
 
-# ─── NORMALIZZAZIONE COLONNA Net PnL ─────────────────────────────────────────
+# ─── NORMALIZZAZIONE COLONNA Net PnL ────────────────────────────────────────────────────────────────────────────────
 _NET_PNL_ALIASES = {
     'net pnl': 'Net PnL', 'netpnl': 'Net PnL', 'net p&l': 'Net PnL',
     'netp&l': 'Net PnL', 'net pl': 'Net PnL', 'netpl': 'Net PnL',
@@ -391,6 +391,19 @@ def preprocess_df(file_bytes: bytes) -> pd.DataFrame:
     df = df[~df['Strategy'].astype(str).str.contains('Legendary', na=False, case=False)].copy()
     return df
 
+
+def _format_ban_freq(banned_freq: Counter) -> str:
+    """Formatta il Counter dei ban storici come 'Mon(3x) Wed(1x)' ecc."""
+    if not banned_freq:
+        return "Nessuno"
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    parts = []
+    for day_idx in sorted(banned_freq.keys()):
+        name = day_names[day_idx] if day_idx < len(day_names) else str(day_idx)
+        parts.append(f"{name}({banned_freq[day_idx]}x)")
+    return " ".join(parts)
+
+
 if uploaded_file is not None:
     file_bytes = uploaded_file.getvalue()
     try:
@@ -408,7 +421,7 @@ if uploaded_file is not None:
         if strat not in st.session_state['strategy_mapping']:
             st.session_state['strategy_mapping'][strat] = ''
 
-    # ─── SIDEBAR ──────────────────────────────────────────────────────────────
+    # ─── SIDEBAR ─────────────────────────────────────────────────────────────────────────────────────
     st.sidebar.header("\u2699\ufe0f Configurazione")
 
     st.sidebar.subheader("\U0001f4be Backup configurazione")
@@ -682,9 +695,15 @@ if uploaded_file is not None:
                 sizing_realized_by_window = []
                 current_capital          = _sz_cap
 
-                # ── Accumula log CUSUM per la sezione di output ──
-                # Struttura: {strategy: {"banned": [...], "oos_before": int, "oos_after": int,
-                #                        "fully_killed": int}}  (aggregato su tutte le finestre)
+                # ── cusum_log: traccia frequenza storica dei ban e giorni bannati nell'ultima IS ──
+                # Struttura:
+                #   cusum_log[sn] = {
+                #       "banned_freq":   Counter({day_idx: n_finestre_in_cui_e_stato_bannato}),
+                #       "last_banned":   lista giorni bannati nell'ultima finestra IS in cui la strategia è apparsa,
+                #       "oos_before":    int  (trade OOS cumulativi prima del filtro),
+                #       "oos_after":     int  (trade OOS cumulativi dopo il filtro),
+                #       "fully_killed":  int  (n. finestre in cui tutti i trade OOS erano bannati),
+                #   }
                 cusum_log: dict = {}
 
                 for win_start, win_end, oos_start, oos_end in windows:
@@ -753,14 +772,19 @@ if uploaded_file is not None:
                         # ── Accumula nel log CUSUM ──
                         if sn not in cusum_log:
                             cusum_log[sn] = {
-                                "banned": banned_days,
-                                "oos_before": 0,
-                                "oos_after": 0,
+                                "banned_freq":  Counter(),  # quante finestre ogni giorno è stato bannato
+                                "last_banned":  [],          # giorni bannati nell'ultima IS in cui la strategia appare
+                                "oos_before":   0,
+                                "oos_after":    0,
                                 "fully_killed": 0,
                             }
-                        cusum_log[sn]["banned"]     = banned_days  # si aggiorna all'ultima IS
-                        cusum_log[sn]["oos_before"] += oos_before
-                        cusum_log[sn]["oos_after"]  += oos_after
+                        # Frequenza storica: incrementa il contatore per ogni giorno bannato in questa finestra
+                        for day_idx in banned_days:
+                            cusum_log[sn]["banned_freq"][day_idx] += 1
+                        # Giorni bannati attivi = quelli dell'ultima finestra IS in cui la strategia appare
+                        cusum_log[sn]["last_banned"]  = banned_days
+                        cusum_log[sn]["oos_before"]  += oos_before
+                        cusum_log[sn]["oos_after"]   += oos_after
 
                         # ── SCARTA se tutti i trade OOS erano nei giorni bannati ──
                         if strat_oos.empty:
@@ -827,7 +851,7 @@ if uploaded_file is not None:
                     "cusum_log":                 cusum_log,
                 }
 
-        # ─── OUTPUT ────────────────────────────────────────────────────────────
+        # ─── OUTPUT ──────────────────────────────────────────────────────────────────────────────────
         if "wfa_results" not in st.session_state:
             st.info("Configura i parametri e premi \u25b6 Lancia simulazione WFA.")
         else:
@@ -839,7 +863,7 @@ if uploaded_file is not None:
 
             pnl_col = "EC Weighted Net PnL" if _ec_en_res else "Weighted Net PnL"
 
-            # ── Sezione 1: Allocazione corrente ──────────────────────────────
+            # ── Sezione 1: Allocazione corrente ───────────────────────────────────────────────
             st.markdown("## \U0001f4cb Allocazione Corrente")
             latest_window_end = final_oos_df["OOS End"].max()
             latest_alloc = final_oos_df[final_oos_df["OOS End"] == latest_window_end].copy()
@@ -849,7 +873,7 @@ if uploaded_file is not None:
                 display_cols += ["Contracts", "Risk $"]
             st.dataframe(latest_alloc[display_cols].reset_index(drop=True), use_container_width=True)
 
-            # ── Sezione 2: Metriche OOS ───────────────────────────────────────
+            # ── Sezione 2: Metriche OOS ────────────────────────────────────────────────────
             st.markdown("## \U0001f4ca Metriche OOS")
             tab_labels = ["Weighted PnL"]
             if _ec_en_res:
@@ -868,7 +892,7 @@ if uploaded_file is not None:
                 with metrics_tabs[tab_idx]:
                     render_metrics(calculate_metrics(final_oos_df, "Realized PnL $"), "Realized PnL $")
 
-            # ── Sezione 3: Curva equity ───────────────────────────────────────
+            # ── Sezione 3: Curva equity ─────────────────────────────────────────────────────
             st.markdown("## \U0001f4c8 Curva Equity OOS")
             daily_pnl = final_oos_df.groupby(final_oos_df["Date Closed"].dt.date)[pnl_col].sum()
             cum_pnl   = daily_pnl.cumsum()
@@ -892,34 +916,35 @@ if uploaded_file is not None:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # ── Sezione 4: CUSUM Weekday Killer ──────────────────────────────
+            # ── Sezione 4: CUSUM Weekday Killer ─────────────────────────────────────────────
             st.markdown("## \U0001f5d3\ufe0f CUSUM Weekday Killer")
             st.caption(
-                "Giorni bannati via CUSUM sulla finestra IS. "
-                "Se una strategia aveva trade OOS *esclusivamente* nei giorni bannati, "
-                "viene contata come 'Finestre Scartate' e rimossa da quella finestra."
+                "**Giorni Bannati (ultima IS)**: giorni effettivamente bannati nell'ultima finestra IS — operativi adesso. "
+                "**Frequenza Storica Ban**: quante finestre IS ogni giorno è stato bannato nel corso dell'intera simulazione."
             )
             if cusum_log:
                 cusum_rows = []
                 for sn, info in sorted(cusum_log.items()):
-                    banned      = info["banned"]
+                    last_banned = info.get("last_banned", [])
+                    banned_freq = info.get("banned_freq", Counter())
                     oos_before  = info["oos_before"]
                     oos_after   = info["oos_after"]
                     filtered    = oos_before - oos_after
                     killed      = info["fully_killed"]
                     pct_filt    = (filtered / oos_before * 100) if oos_before > 0 else 0.0
                     cusum_rows.append({
-                        "Strategia":           sn,
-                        "Giorni Bannati":      format_banned_days(banned),
-                        "Trade OOS Totali":    oos_before,
-                        "Trade Filtrati":      filtered,
-                        "% Filtrati":          f"{pct_filt:.1f}%",
-                        "Finestre Scartate":   killed,
+                        "Strategia":                sn,
+                        "Giorni Bannati (ultima IS)": format_banned_days(last_banned),
+                        "Frequenza Storica Ban":      _format_ban_freq(banned_freq),
+                        "Trade OOS Totali":           oos_before,
+                        "Trade Filtrati":             filtered,
+                        "% Filtrati":                f"{pct_filt:.1f}%",
+                        "Finestre Scartate":         killed,
                     })
                 cusum_df = pd.DataFrame(cusum_rows)
-                # Evidenzia in rosso le righe con giorni bannati
+                # Evidenzia in rosso le righe con giorni bannati nell'ultima IS
                 def _highlight_banned(row):
-                    if row["Giorni Bannati"] != "Nessuno":
+                    if row["Giorni Bannati (ultima IS)"] != "Nessuno":
                         return ["color: #ef4444"] * len(row)
                     return [""] * len(row)
                 st.dataframe(
@@ -930,7 +955,7 @@ if uploaded_file is not None:
             else:
                 st.info("Nessun dato CUSUM disponibile.")
 
-            # ── Sezione 5: Storico allocazioni ────────────────────────────────
+            # ── Sezione 5: Storico allocazioni ────────────────────────────────────────────────
             st.markdown("## \U0001f5c2\ufe0f Storico Allocazioni OOS")
             show_cols = ["Date Closed", "Strategy", "Net PnL", "Weighted Net PnL", "Weight", "Rank",
                          "IS Start", "OOS Start", "OOS End"]
@@ -941,7 +966,7 @@ if uploaded_file is not None:
             show_cols = [c for c in show_cols if c in final_oos_df.columns]
             st.dataframe(final_oos_df[show_cols].reset_index(drop=True), use_container_width=True)
 
-            # ── Sezione 6: Export ──────────────────────────────────────────────
+            # ── Sezione 6: Export ───────────────────────────────────────────────────────────────────
             st.markdown("## \U0001f4be Esporta Dati")
             csv_bytes = final_oos_df[show_cols].to_csv(index=False).encode("utf-8")
             st.download_button(
