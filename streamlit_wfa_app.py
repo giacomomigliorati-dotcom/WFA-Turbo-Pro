@@ -144,7 +144,7 @@ Esporta e reimporta la configurazione JSON per non perderla dopo il refresh.
 configurabile (multipli di OOS step) è negativo. Utile per bloccare strategie in trend discendente.
 
 **5. CUSUM Weekday Killer** — Blacklist weekday per combinazioni strategia/giorno anomale.
-Se una strategia trada *esclusivamente* nei giorni bannati, viene scartata completamente.
+Se una strategia trada *esclusivamente* nei giorni bannati, viene **scartata completamente** da quella finestra OOS.
 
 **6. Anti-overlap + rotazione frazionata** — Top-N strategie, max per gruppo, pesi pieno/panchina.
 
@@ -165,7 +165,7 @@ Le strategie in panchina con RiskFactor EC ≤ 0.50 vengono escluse dall'allocaz
 2. Al prossimo accesso: **📥 Importa** → **✅ Applica**
         """)
 
-# ─── COSTANTI LOCALI (solo quelle non in wfa_core) ───────────────────────────
+# ─── COSTANTI LOCALI ────────────────────────────────────────────────────────────────
 DEFAULT_GROUP_MAPPING = {
     'Condor ZM+': 'Iron Condor',
     'TEST - Iron Condor delle 20:00': 'Iron Condor',
@@ -270,7 +270,6 @@ def build_config_payload():
         "ec_p80":               int(st.session_state.get("ec_p80",               DEFAULT_EC_P80)),
         "ec_p90":               int(st.session_state.get("ec_p90",               DEFAULT_EC_P90)),
         "ec_p95":               int(st.session_state.get("ec_p95",               DEFAULT_EC_P95)),
-        # Sizing
         "sizing_enabled":            bool(st.session_state.get("sizing_enabled",            DEFAULT_SIZING_ENABLED)),
         "sizing_initial_capital":    float(st.session_state.get("sizing_initial_capital",   DEFAULT_INITIAL_CAPITAL)),
         "sizing_max_daily_loss_pct": float(st.session_state.get("sizing_max_daily_loss_pct",DEFAULT_MAX_DAILY_LOSS_PCT)),
@@ -313,10 +312,7 @@ def apply_config_payload(payload, all_strategies):
     st.session_state["sizing_max_daily_loss_pct"] = max(0.1, min(20.0, float(payload.get("sizing_max_daily_loss_pct", DEFAULT_MAX_DAILY_LOSS_PCT))))
     st.session_state["sizing_compounding"]        = bool(payload.get("sizing_compounding",         DEFAULT_COMPOUNDING))
     raw_cfgs = payload.get("sizing_strategy_configs", {})
-    if isinstance(raw_cfgs, dict):
-        st.session_state["sizing_strategy_configs"] = raw_cfgs
-    else:
-        st.session_state["sizing_strategy_configs"] = {}
+    st.session_state["sizing_strategy_configs"] = raw_cfgs if isinstance(raw_cfgs, dict) else {}
 
 # ─── INIT SESSION STATE ───────────────────────────────────────────────────────
 _SS_DEFAULTS = {
@@ -334,4 +330,629 @@ _SS_DEFAULTS = {
     "ec_p80":             DEFAULT_EC_P80,
     "ec_p90":             DEFAULT_EC_P90,
     "ec_p95":             DEFAULT_EC_P95,
-    "sizing_enabled":           
+    "sizing_enabled":            DEFAULT_SIZING_ENABLED,
+    "sizing_initial_capital":    DEFAULT_INITIAL_CAPITAL,
+    "sizing_max_daily_loss_pct": DEFAULT_MAX_DAILY_LOSS_PCT,
+    "sizing_compounding":        DEFAULT_COMPOUNDING,
+    "sizing_strategy_configs":   {},
+}
+for _k, _v in _SS_DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+# ─── UPLOAD CSV ───────────────────────────────────────────────────────────────
+uploaded_file = st.file_uploader("Carica il dataset dei trade (CSV)", type=['csv'])
+
+# ─── NORMALIZZAZIONE COLONNA Net PnL ─────────────────────────────────────────
+_NET_PNL_ALIASES = {
+    'net pnl': 'Net PnL', 'netpnl': 'Net PnL', 'net p&l': 'Net PnL',
+    'netp&l': 'Net PnL', 'net pl': 'Net PnL', 'netpl': 'Net PnL',
+    'net profit': 'Net PnL', 'net profit/loss': 'Net PnL',
+    'pnl': 'Net PnL', 'p&l': 'Net PnL',
+}
+_COMMISSION_COLS = [
+    'Opening Commissions + Fees', 'Closing Commissions + Fees',
+    'Commissions + Fees', 'Commission', 'Fees',
+]
+_PL_RAW_COLS = ['P/L', 'P/L $', 'Gross P/L', 'Gross PnL', 'Profit/Loss']
+
+def _normalize_net_pnl_column(df: pd.DataFrame) -> pd.DataFrame:
+    if 'Net PnL' in df.columns:
+        return df
+    col_lower_map  = {c.strip().lower(): c for c in df.columns}
+    col_nospace_map = {c.strip().lower().replace(' ', ''): c for c in df.columns}
+    for alias, canonical in _NET_PNL_ALIASES.items():
+        if alias in col_lower_map:
+            return df.rename(columns={col_lower_map[alias]: canonical})
+        alias_nospace = alias.replace(' ', '')
+        if alias_nospace in col_nospace_map:
+            return df.rename(columns={col_nospace_map[alias_nospace]: canonical})
+    pl_col = next((c for c in _PL_RAW_COLS if c in df.columns), None)
+    if pl_col is not None:
+        df = df.copy()
+        net = df[pl_col].apply(clean_money)
+        for comm_col in _COMMISSION_COLS:
+            if comm_col in df.columns:
+                net = net - df[comm_col].apply(clean_money).abs()
+        df['Net PnL'] = net
+        return df
+    return df
+
+@st.cache_data(show_spinner=False)
+def preprocess_df(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    df.columns = df.columns.str.strip()
+    df = _normalize_net_pnl_column(df)
+    if 'Net PnL' not in df.columns:
+        raise ValueError(
+            f"Colonna 'Net PnL' non trovata nel CSV. "
+            f"Colonne disponibili: {list(df.columns)}"
+        )
+    df = df[~df['Strategy'].astype(str).str.contains('Legendary', na=False, case=False)].copy()
+    return df
+
+if uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    try:
+        df_raw = preprocess_df(file_bytes)
+    except ValueError as _e:
+        st.error(f"❌ Errore nel CSV caricato: {_e}")
+        st.stop()
+    all_strategies_in_file = sorted(df_raw['Strategy'].dropna().unique().tolist())
+
+    if 'strategy_mapping' not in st.session_state:
+        st.session_state['strategy_mapping'] = DEFAULT_GROUP_MAPPING.copy()
+    if 'group_names' not in st.session_state:
+        st.session_state['group_names'] = sorted(set(DEFAULT_GROUP_MAPPING.values()))
+    for strat in all_strategies_in_file:
+        if strat not in st.session_state['strategy_mapping']:
+            st.session_state['strategy_mapping'][strat] = ''
+
+    # ─── SIDEBAR ──────────────────────────────────────────────────────────────
+    st.sidebar.header("\u2699\ufe0f Configurazione")
+
+    st.sidebar.subheader("\U0001f4be Backup configurazione")
+    st.sidebar.caption("Esporta per salvare tutti i parametri. Reimporta dopo ogni refresh.")
+    config_json_str = json.dumps(build_config_payload(), ensure_ascii=False, indent=2)
+    st.sidebar.download_button(label="\U0001f4e4 Esporta configurazione JSON",
+        data=config_json_str.encode("utf-8"), file_name="texano_config.json", mime="application/json")
+    uploaded_config = st.sidebar.file_uploader("\U0001f4e5 Importa configurazione JSON", type=["json"], key="config_json_uploader")
+    if uploaded_config is not None:
+        try:
+            parsed = json.loads(uploaded_config.getvalue().decode("utf-8"))
+            st.session_state["pending_config_payload"] = parsed
+            st.sidebar.success("\u2705 JSON caricato. Premi 'Applica' per attivarlo.")
+        except Exception as e:
+            st.sidebar.error(f"JSON non valido: {e}")
+    if st.sidebar.button("\u2705 Applica configurazione JSON"):
+        if "pending_config_payload" not in st.session_state:
+            st.sidebar.warning("Carica prima un file JSON.")
+        else:
+            try:
+                apply_config_payload(st.session_state["pending_config_payload"], all_strategies_in_file)
+                del st.session_state["pending_config_payload"]
+                st.sidebar.success("Configurazione applicata!")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Errore: {e}")
+    st.sidebar.divider()
+
+    st.sidebar.subheader("\U0001f3db\ufe0f Parametri WFA")
+    st.sidebar.number_input("Numero strategie selezionate (Top-N)", min_value=1, max_value=20, step=1, help="Default: 7", key="top_n")
+    st.sidebar.number_input("Strategie con peso pieno (rank 1\u2026N)", min_value=0, max_value=int(st.session_state["top_n"]), step=1, key="full_weight_count")
+    st.sidebar.number_input("Peso pieno (%)", min_value=1, max_value=100, step=5, key="full_weight_pct")
+    st.sidebar.number_input("Peso panchina (%)", min_value=1, max_value=100, step=5, key="bench_weight_pct")
+    _bench_count = int(st.session_state["top_n"]) - int(st.session_state["full_weight_count"])
+    st.sidebar.markdown(
+        f"**Schema:** {int(st.session_state['full_weight_count'])}\u00d7"
+        f"{int(st.session_state['full_weight_pct'])}% + "
+        f"{_bench_count}\u00d7{int(st.session_state['bench_weight_pct'])}%"
+    )
+    st.sidebar.divider()
+
+    st.sidebar.subheader("\U0001f3c6 Metrica di Ranking IS")
+    ranking_metric_idx = RANKING_METRICS.index(st.session_state["ranking_metric"]) if st.session_state["ranking_metric"] in RANKING_METRICS else 0
+    st.sidebar.selectbox("Metrica per ordinare le strategie nella finestra IS", options=RANKING_METRICS, index=ranking_metric_idx,
+        help="Omega Ratio: default. Ulcer Index: minore = migliore. ROC: PnL netto su N finestre OOS.", key="ranking_metric")
+    if st.session_state["ranking_metric"] == "ROC":
+        st.sidebar.number_input(f"Finestra ROC (multipli di {OOS_STEP_DAYS}gg)", min_value=1, max_value=24, step=1,
+            help=f"Es. 2 = finestra di {2*OOS_STEP_DAYS} giorni.", key="roc_steps")
+        st.sidebar.caption(f"\U0001f4c5 Finestra ROC attiva: **{int(st.session_state['roc_steps']) * OOS_STEP_DAYS} giorni**")
+    st.sidebar.divider()
+
+    st.sidebar.subheader("\U0001f6ab Filtro ROC < 0")
+    st.sidebar.toggle("Attiva filtro ROC < 0",
+        help="Se attivo, esclude le strategie con Net PnL negativo sulla finestra configurata.", key="roc_filter_enabled")
+    if st.session_state["roc_filter_enabled"]:
+        st.sidebar.number_input(f"Finestra filtro ROC (multipli di {OOS_STEP_DAYS}gg)", min_value=1, max_value=24, step=1, key="roc_filter_steps")
+        st.sidebar.caption(f"\U0001f4c5 Finestra filtro ROC: **{int(st.session_state['roc_filter_steps']) * OOS_STEP_DAYS} giorni**")
+    st.sidebar.divider()
+
+    st.sidebar.subheader("\U0001f4c9 Equity Control")
+    st.sidebar.toggle("Attiva Equity Control",
+        help="Modula il rischio per strategia in base al drawdown OOS corrente rispetto ai percentili IS.", key="ec_enabled")
+    if st.session_state["ec_enabled"]:
+        ec_mode_options = ["Trailing", "Fisso"]
+        ec_mode_idx = ec_mode_options.index(st.session_state["ec_capital_mode"]) if st.session_state["ec_capital_mode"] in ec_mode_options else 0
+        st.sidebar.selectbox("Modalita capitale", options=ec_mode_options, index=ec_mode_idx,
+            help="Trailing: equity cumulativa. Fisso: reset a ogni finestra OOS.", key="ec_capital_mode")
+        st.sidebar.number_input("Percentile DD soglia P80 (half size)", min_value=50, max_value=95, step=5,
+            help="Sotto questa soglia DD: RiskFactor=1.0.", key="ec_p80")
+        st.sidebar.number_input("Percentile DD soglia P90 (quarter size)",
+            min_value=int(st.session_state["ec_p80"]) + 1, max_value=98, step=1,
+            help="Tra P80 e P90: RiskFactor=0.5.", key="ec_p90")
+        st.sidebar.number_input("Percentile DD soglia P95 (stop totale)",
+            min_value=int(st.session_state["ec_p90"]) + 1, max_value=99, step=1,
+            help="Tra P90 e P95: RiskFactor=0.25. Oltre P95: RiskFactor=0.0.", key="ec_p95")
+        st.sidebar.caption(
+            f"**Schema attivo:** DD<P{int(st.session_state['ec_p80'])}=100% "
+            f"| P{int(st.session_state['ec_p80'])}-P{int(st.session_state['ec_p90'])}=50% "
+            f"| P{int(st.session_state['ec_p90'])}-P{int(st.session_state['ec_p95'])}=25% "
+            f"| DD>=P{int(st.session_state['ec_p95'])}=0%"
+        )
+    st.sidebar.divider()
+
+    st.sidebar.subheader("\U0001f4b0 Position Sizing")
+    st.sidebar.toggle("Attiva Position Sizing",
+        help="Calcola il numero di contratti per ogni trade OOS. Richiede la colonna 'Premium' nel CSV.", key="sizing_enabled")
+    if st.session_state["sizing_enabled"]:
+        st.sidebar.number_input("Capitale iniziale ($)", min_value=1_000, max_value=10_000_000, step=1_000,
+            help=f"Default: ${DEFAULT_INITIAL_CAPITAL:,.0f}", key="sizing_initial_capital")
+        st.sidebar.number_input("Max perdita giornaliera (%)", min_value=0.1, max_value=20.0, step=0.1,
+            help=f"Budget di rischio giornaliero come % del capitale. Default: {DEFAULT_MAX_DAILY_LOSS_PCT}%", key="sizing_max_daily_loss_pct")
+        st.sidebar.toggle("Compounding (reinvestimento profitti)",
+            help="Se attivo, il capitale si aggiorna con i profitti/perdite finestra per finestra.", key="sizing_compounding")
+        with st.sidebar.expander("⚙️ Parametri per strategia", expanded=False):
+            st.caption("Cap %: % del capitale per questa strategia. SL USD: stop-loss per contratto. SL %: stop come % del premio.")
+            current_cfgs = st.session_state.get("sizing_strategy_configs", {})
+            updated_cfgs = {}
+            for strat in all_strategies_in_file:
+                cfg = current_cfgs.get(strat, {})
+                st.markdown(f"**{strat}**")
+                c1, c2, c3 = st.columns(3)
+                cap    = c1.number_input("Cap %",  min_value=0.1, max_value=100.0, step=0.5, value=float(cfg.get("cap_pct", DEFAULT_CAP_PCT)), key=f"sz_cap_{strat}")
+                sl_usd = c2.number_input("SL $",   min_value=1.0, max_value=50_000.0, step=10.0, value=float(cfg.get("sl_usd", DEFAULT_SL_USD)), key=f"sz_slusd_{strat}")
+                sl_pct = c3.number_input("SL %",   min_value=0.0, max_value=100.0, step=0.5, value=float(cfg.get("sl_pct", DEFAULT_SL_PCT)), key=f"sz_slpct_{strat}")
+                updated_cfgs[strat] = {"cap_pct": cap, "sl_usd": sl_usd, "sl_pct": sl_pct}
+            if st.button("\u2705 Salva parametri sizing"):
+                st.session_state["sizing_strategy_configs"] = updated_cfgs
+                st.sidebar.success("Parametri sizing salvati — esporta il JSON!")
+                st.rerun()
+    st.sidebar.divider()
+
+    st.sidebar.subheader("Limite per gruppo")
+    st.sidebar.number_input("Max strategie stesso gruppo", min_value=1, max_value=int(st.session_state["top_n"]), step=1, help="Default 2", key="max_per_group")
+    st.sidebar.divider()
+
+    st.sidebar.subheader("Gestione gruppi")
+    new_group_name = st.sidebar.text_input("Nome nuovo gruppo", key="new_group_name")
+    if st.sidebar.button("\u2795 Crea gruppo"):
+        clean_name = new_group_name.strip()
+        if clean_name:
+            if clean_name not in st.session_state['group_names']:
+                st.session_state['group_names'].append(clean_name)
+                st.session_state['group_names'] = sorted(st.session_state['group_names'])
+                st.sidebar.success(f"Gruppo '{clean_name}' creato")
+                st.rerun()
+            else:
+                st.sidebar.warning("Gruppo gi\u00e0 esistente")
+        else:
+            st.sidebar.warning("Inserisci un nome valido")
+    if st.session_state['group_names']:
+        group_to_rename = st.sidebar.selectbox("Gruppo da rinominare", options=st.session_state['group_names'], key="group_to_rename")
+        renamed_group = st.sidebar.text_input("Nuovo nome", key="renamed_group")
+        if st.sidebar.button("\u270f\ufe0f Rinomina gruppo"):
+            old_name, new_name = group_to_rename, renamed_group.strip()
+            if not new_name:
+                st.sidebar.warning("Inserisci un nome valido")
+            elif new_name in st.session_state['group_names'] and new_name != old_name:
+                st.sidebar.warning("Nome gi\u00e0 esistente")
+            else:
+                st.session_state['group_names'] = [new_name if g == old_name else g for g in st.session_state['group_names']]
+                st.session_state['strategy_mapping'] = {s: (new_name if g == old_name else g) for s, g in st.session_state['strategy_mapping'].items()}
+                st.sidebar.success(f"'{old_name}' \u2192 '{new_name}'")
+                st.rerun()
+    st.sidebar.divider()
+
+    st.sidebar.subheader("Assegnazione strategie")
+    group_options = [''] + st.session_state['group_names']
+    with st.sidebar.expander("\U0001f4cb Modifica gruppo di ogni strategia", expanded=True):
+        updated_mapping = {}
+        for strat in all_strategies_in_file:
+            cur = st.session_state['strategy_mapping'].get(strat, '')
+            idx = group_options.index(cur) if cur in group_options else 0
+            sel = st.selectbox(label=strat, options=group_options, index=idx, key=f"group_{strat}")
+            updated_mapping[strat] = sel
+        if st.button("\u2705 Salva assegnazioni"):
+            st.session_state['strategy_mapping'] = updated_mapping
+            st.sidebar.success("Assegnazioni aggiornate \u2014 esporta il JSON!")
+            st.rerun()
+
+    strategy_mapping = st.session_state['strategy_mapping']
+    still_unmapped = [s for s in all_strategies_in_file if not strategy_mapping.get(s, '').strip()]
+    if still_unmapped:
+        st.error(f"\U0001f6d1 BLOCCO DI SICUREZZA: Strategie senza gruppo: {', '.join(still_unmapped)}")
+        st.info("Apri la sidebar (\u25b6), assegna un gruppo a ogni strategia e salva.")
+        st.stop()
+
+    top_n             = int(st.session_state["top_n"])
+    full_weight_count = int(st.session_state["full_weight_count"])
+    full_weight_pct   = int(st.session_state["full_weight_pct"])
+    bench_weight_pct  = int(st.session_state["bench_weight_pct"])
+    max_per_group     = int(st.session_state["max_per_group"])
+    ranking_metric    = st.session_state["ranking_metric"]
+    roc_steps         = int(st.session_state["roc_steps"])
+    roc_filter_enabled= bool(st.session_state["roc_filter_enabled"])
+    roc_filter_steps  = int(st.session_state["roc_filter_steps"])
+    bench_count       = top_n - full_weight_count
+    ec_enabled        = bool(st.session_state["ec_enabled"])
+    ec_capital_mode   = st.session_state["ec_capital_mode"]
+    ec_p80            = int(st.session_state["ec_p80"])
+    ec_p90            = int(st.session_state["ec_p90"])
+    ec_p95            = int(st.session_state["ec_p95"])
+    sizing_enabled            = bool(st.session_state["sizing_enabled"])
+    sizing_initial_capital    = float(st.session_state["sizing_initial_capital"])
+    sizing_max_daily_loss_pct = float(st.session_state["sizing_max_daily_loss_pct"])
+    sizing_compounding        = bool(st.session_state["sizing_compounding"])
+    sizing_strategy_configs   = st.session_state.get("sizing_strategy_configs", {})
+
+    tab_wfa, tab_opt = st.tabs(["\U0001f4ca Walk-Forward", "\u2699\ufe0f Ottimizzatore"])
+
+    with tab_wfa:
+        st.markdown("---")
+        col_launch, col_info = st.columns([3, 7])
+        with col_launch:
+            launch = st.button("\u25b6 Lancia simulazione WFA", type="primary", use_container_width=True)
+        with col_info:
+            roc_filter_label = (
+                f" &nbsp;|&nbsp; \U0001f6ab ROC filter: <b style='color:#ef4444'>{roc_filter_steps*OOS_STEP_DAYS}gg</b>"
+            ) if roc_filter_enabled else ""
+            ec_label = (
+                f" &nbsp;|&nbsp; \U0001f4c9 EC: <b style='color:#22c55e'>{ec_capital_mode}</b>"
+            ) if ec_enabled else ""
+            sizing_label = (
+                f" &nbsp;|&nbsp; \U0001f4b0 Sizing: <b style='color:#f59e0b'>ON</b>"
+                f" | Capital: <b style='color:#f59e0b'>${sizing_initial_capital:,.0f}</b>"
+                f" | MaxDD: <b style='color:#f59e0b'>{sizing_max_daily_loss_pct:.1f}%</b>"
+            ) if sizing_enabled else ""
+            ranking_label_color = "#f59e0b" if ranking_metric != "Omega Ratio" else "#00d4ff"
+            st.markdown(
+                f"<div style='padding-top:10px; color:#7a9abf; font-size:0.88rem;'>"
+                f"Ranking: <b style='color:{ranking_label_color}'>{ranking_metric}</b>"
+                + (f" ({roc_steps*OOS_STEP_DAYS}gg)" if ranking_metric == "ROC" else "")
+                + f" &nbsp;|&nbsp; Top-N: <b style='color:#00d4ff'>{top_n}</b>"
+                f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{full_weight_count}\u00d7{full_weight_pct}%</b>"
+                f" + <b style='color:#f59e0b'>{bench_count}\u00d7{bench_weight_pct}%</b>"
+                f" &nbsp;|&nbsp; Max/gr: <b style='color:#00d4ff'>{max_per_group}</b>"
+                + roc_filter_label + ec_label + sizing_label + "</div>",
+                unsafe_allow_html=True
+            )
+
+        if launch:
+            _top_n   = top_n
+            _fwc     = full_weight_count
+            _fwp     = full_weight_pct / 100.0
+            _bwp     = bench_weight_pct / 100.0
+            _mpg     = max_per_group
+            _sm      = dict(strategy_mapping)
+            _metric  = ranking_metric
+            _roc_s   = roc_steps
+            _roc_fe  = roc_filter_enabled
+            _roc_fs  = roc_filter_steps
+            _ec_en   = ec_enabled
+            _ec_mode = ec_capital_mode
+            _ec_p80  = ec_p80
+            _ec_p90  = ec_p90
+            _ec_p95  = ec_p95
+            _sz_en   = sizing_enabled
+            _sz_cap  = sizing_initial_capital
+            _sz_mdl  = sizing_max_daily_loss_pct
+            _sz_comp = sizing_compounding
+            _sz_cfgs = dict(sizing_strategy_configs)
+
+            with st.spinner("Elaborazione Walk-Forward in corso..."):
+                df_filtered = df_raw.copy()
+                df_filtered['Date Opened'] = pd.to_datetime(df_filtered['Date Opened'], dayfirst=True, errors='coerce')
+                df_filtered['Date Closed'] = pd.to_datetime(df_filtered['Date Closed'], dayfirst=True, errors='coerce')
+                df_filtered = df_filtered.dropna(subset=['Date Opened', 'Date Closed'])
+                df_filtered['Net PnL'] = df_filtered['Net PnL'].apply(clean_money)
+                df_filtered['weekday_open'] = df_filtered['Date Opened'].dt.dayofweek
+
+                min_date   = df_filtered['Date Closed'].min()
+                max_date   = df_filtered['Date Closed'].max()
+                IS_DAYS    = 365
+
+                windows = []
+                win_start = min_date
+                while True:
+                    win_end   = win_start + pd.Timedelta(days=IS_DAYS)
+                    oos_start = win_end
+                    oos_end   = oos_start + pd.Timedelta(days=OOS_STEP_DAYS)
+                    if oos_end > max_date:
+                        break
+                    windows.append((win_start, win_end, oos_start, oos_end))
+                    win_start = win_start + pd.Timedelta(days=OOS_STEP_DAYS)
+
+                if not windows:
+                    st.error("Dati insufficienti per generare finestre WFA.")
+                    st.stop()
+
+                historical_allocations   = []
+                ec_trailing_equity       = {}
+                sizing_realized_by_window = []
+                current_capital          = _sz_cap
+
+                # ── Accumula log CUSUM per la sezione di output ──
+                # Struttura: {strategy: {"banned": [...], "oos_before": int, "oos_after": int,
+                #                        "fully_killed": int}}  (aggregato su tutte le finestre)
+                cusum_log: dict = {}
+
+                for win_start, win_end, oos_start, oos_end in windows:
+                    is_data  = df_filtered[(df_filtered['Date Closed'] >= win_start) & (df_filtered['Date Closed'] < win_end)]
+                    oos_data = df_filtered[(df_filtered['Date Closed'] >= oos_start) & (df_filtered['Date Closed'] < oos_end)]
+
+                    if is_data.empty or oos_data.empty:
+                        continue
+
+                    strategy_scores        = {}
+                    cusum_banned_by_strat  = {}
+                    ec_thresholds_by_strat = {}
+
+                    for sn in is_data['Strategy'].unique():
+                        if not _sm.get(sn, '').strip():
+                            continue
+                        strat_is = is_data[is_data['Strategy'] == sn].copy()
+                        score, higher_is_better = compute_ranking_score(strat_is, _metric, _roc_s)
+                        if _roc_fe and not passes_roc_filter(strat_is, _roc_fs):
+                            continue
+                        strategy_scores[sn] = (score, higher_is_better)
+                        cusum_banned_by_strat[sn] = compute_cusum_banned(strat_is)
+                        if _ec_en:
+                            ec_thresholds_by_strat[sn] = compute_dd_percentiles_from_is(
+                                strat_is, _ec_p80, _ec_p90, _ec_p95
+                            )
+
+                    if not strategy_scores:
+                        continue
+
+                    representative_hib = next(iter(strategy_scores.values()))[1]
+                    sorted_strats = sorted(
+                        strategy_scores.keys(),
+                        key=lambda s: strategy_scores[s][0],
+                        reverse=representative_hib,
+                    )
+
+                    group_counts = Counter()
+                    selected = []
+                    for sn in sorted_strats:
+                        grp = _sm.get(sn, '')
+                        if group_counts[grp] < _mpg:
+                            selected.append(sn)
+                            group_counts[grp] += 1
+                        if len(selected) >= _top_n:
+                            break
+
+                    if not selected:
+                        continue
+
+                    _fwc_eff = min(_fwc, len(selected))
+                    for rank, sn in enumerate(selected):
+                        weight    = _fwp if rank < _fwc_eff else _bwp
+                        strat_oos = oos_data[oos_data['Strategy'] == sn].copy()
+                        if strat_oos.empty:
+                            continue
+
+                        banned_days  = cusum_banned_by_strat.get(sn, [])
+                        oos_before   = len(strat_oos)
+
+                        if banned_days:
+                            strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned_days)]
+
+                        oos_after = len(strat_oos)
+
+                        # ── Accumula nel log CUSUM ──
+                        if sn not in cusum_log:
+                            cusum_log[sn] = {
+                                "banned": banned_days,
+                                "oos_before": 0,
+                                "oos_after": 0,
+                                "fully_killed": 0,
+                            }
+                        cusum_log[sn]["banned"]     = banned_days  # si aggiorna all'ultima IS
+                        cusum_log[sn]["oos_before"] += oos_before
+                        cusum_log[sn]["oos_after"]  += oos_after
+
+                        # ── SCARTA se tutti i trade OOS erano nei giorni bannati ──
+                        if strat_oos.empty:
+                            cusum_log[sn]["fully_killed"] += 1
+                            continue
+
+                        strat_oos = strat_oos.copy()
+                        strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
+                        strat_oos['Weight']    = weight
+                        strat_oos['Rank']      = rank + 1
+                        strat_oos['IS Start']  = win_start
+                        strat_oos['IS End']    = win_end
+                        strat_oos['OOS Start'] = oos_start
+                        strat_oos['OOS End']   = oos_end
+
+                        if _ec_en:
+                            thresholds = ec_thresholds_by_strat.get(sn, {})
+                            start_eq   = ec_trailing_equity.get(sn, 0.0) if _ec_mode == "Trailing" else 0.0
+                            strat_oos  = apply_equity_control(strat_oos, thresholds, _ec_mode, start_eq)
+                            if _ec_mode == "Trailing":
+                                ec_trailing_equity[sn] = start_eq + strat_oos["Net PnL"].sum()
+                        else:
+                            strat_oos['RiskFactor']          = 1.0
+                            strat_oos['EC Weighted Net PnL'] = strat_oos['Weighted Net PnL']
+                            strat_oos['EC Tracking Equity']  = 0.0
+
+                        if _sz_en:
+                            cfg_dict = _sz_cfgs.get(sn, {})
+                            sz_cfg = StrategySizingConfig(
+                                cap_pct=float(cfg_dict.get("cap_pct", DEFAULT_CAP_PCT)),
+                                sl_usd=float(cfg_dict.get("sl_usd",  DEFAULT_SL_USD)),
+                                sl_pct=float(cfg_dict.get("sl_pct",  DEFAULT_SL_PCT)),
+                            )
+                            strat_oos = apply_portfolio_sizing(strat_oos, sz_cfg, current_capital, _sz_mdl)
+
+                        historical_allocations.append(strat_oos)
+
+                    if _sz_en and _sz_comp and historical_allocations:
+                        window_realized = sum(
+                            t["Realized PnL $"].sum()
+                            for t in historical_allocations
+                            if "Realized PnL $" in t.columns
+                            and t["OOS Start"].iloc[0] == oos_start
+                        )
+                        current_capital = max(1_000.0, current_capital + window_realized)
+                        sizing_realized_by_window.append(window_realized)
+
+                if not historical_allocations:
+                    st.error("Nessun trade OOS generato.")
+                    st.stop()
+
+                final_oos_df = pd.concat(historical_allocations, ignore_index=True)
+
+                st.session_state["wfa_results"] = {
+                    "final_oos_df":              final_oos_df,
+                    "windows":                   windows,
+                    "ec_enabled":                _ec_en,
+                    "sizing_enabled":            _sz_en,
+                    "sizing_initial_capital":    _sz_cap,
+                    "sizing_max_daily_loss_pct": _sz_mdl,
+                    "sizing_compounding":        _sz_comp,
+                    "sizing_final_capital":      current_capital,
+                    "sizing_realized_by_window": sizing_realized_by_window,
+                    "cusum_log":                 cusum_log,
+                }
+
+        # ─── OUTPUT ────────────────────────────────────────────────────────────
+        if "wfa_results" not in st.session_state:
+            st.info("Configura i parametri e premi \u25b6 Lancia simulazione WFA.")
+        else:
+            res          = st.session_state["wfa_results"]
+            final_oos_df = res["final_oos_df"]
+            _ec_en_res   = res.get("ec_enabled", False)
+            _sz_en_res   = res.get("sizing_enabled", False)
+            cusum_log    = res.get("cusum_log", {})
+
+            pnl_col = "EC Weighted Net PnL" if _ec_en_res else "Weighted Net PnL"
+
+            # ── Sezione 1: Allocazione corrente ──────────────────────────────
+            st.markdown("## \U0001f4cb Allocazione Corrente")
+            latest_window_end = final_oos_df["OOS End"].max()
+            latest_alloc = final_oos_df[final_oos_df["OOS End"] == latest_window_end].copy()
+            latest_alloc = latest_alloc.drop_duplicates(subset=["Strategy"])
+            display_cols = ["Strategy", "Rank", "Weight", "RiskFactor"]
+            if _sz_en_res and "Contracts" in latest_alloc.columns:
+                display_cols += ["Contracts", "Risk $"]
+            st.dataframe(latest_alloc[display_cols].reset_index(drop=True), use_container_width=True)
+
+            # ── Sezione 2: Metriche OOS ───────────────────────────────────────
+            st.markdown("## \U0001f4ca Metriche OOS")
+            tab_labels = ["Weighted PnL"]
+            if _ec_en_res:
+                tab_labels.append("EC Weighted PnL")
+            if _sz_en_res and "Realized PnL $" in final_oos_df.columns:
+                tab_labels.append("Realized PnL $")
+            metrics_tabs = st.tabs(tab_labels)
+            with metrics_tabs[0]:
+                render_metrics(calculate_metrics(final_oos_df, "Weighted Net PnL"), "Weighted Net PnL")
+            tab_idx = 1
+            if _ec_en_res:
+                with metrics_tabs[tab_idx]:
+                    render_metrics(calculate_metrics(final_oos_df, "EC Weighted Net PnL"), "EC Weighted Net PnL")
+                tab_idx += 1
+            if _sz_en_res and "Realized PnL $" in final_oos_df.columns:
+                with metrics_tabs[tab_idx]:
+                    render_metrics(calculate_metrics(final_oos_df, "Realized PnL $"), "Realized PnL $")
+
+            # ── Sezione 3: Curva equity ───────────────────────────────────────
+            st.markdown("## \U0001f4c8 Curva Equity OOS")
+            daily_pnl = final_oos_df.groupby(final_oos_df["Date Closed"].dt.date)[pnl_col].sum()
+            cum_pnl   = daily_pnl.cumsum()
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(cum_pnl.index), y=list(cum_pnl.values),
+                mode="lines", name=pnl_col, line=dict(color="#00d4ff", width=2),
+            ))
+            if _sz_en_res and "Realized PnL $" in final_oos_df.columns:
+                daily_real = final_oos_df.groupby(final_oos_df["Date Closed"].dt.date)["Realized PnL $"].sum()
+                cum_real   = daily_real.cumsum()
+                fig.add_trace(go.Scatter(
+                    x=list(cum_real.index), y=list(cum_real.values),
+                    mode="lines", name="Realized PnL $", line=dict(color="#22c55e", width=2, dash="dot"),
+                ))
+            fig.update_layout(
+                **OZONE_LAYOUT,
+                title="Equity Curve OOS",
+                xaxis_title="Data", yaxis_title="PnL cumulativo ($)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ── Sezione 4: CUSUM Weekday Killer ──────────────────────────────
+            st.markdown("## \U0001f5d3\ufe0f CUSUM Weekday Killer")
+            st.caption(
+                "Giorni bannati via CUSUM sulla finestra IS. "
+                "Se una strategia aveva trade OOS *esclusivamente* nei giorni bannati, "
+                "viene contata come 'Finestre Scartate' e rimossa da quella finestra."
+            )
+            if cusum_log:
+                cusum_rows = []
+                for sn, info in sorted(cusum_log.items()):
+                    banned      = info["banned"]
+                    oos_before  = info["oos_before"]
+                    oos_after   = info["oos_after"]
+                    filtered    = oos_before - oos_after
+                    killed      = info["fully_killed"]
+                    pct_filt    = (filtered / oos_before * 100) if oos_before > 0 else 0.0
+                    cusum_rows.append({
+                        "Strategia":           sn,
+                        "Giorni Bannati":      format_banned_days(banned),
+                        "Trade OOS Totali":    oos_before,
+                        "Trade Filtrati":      filtered,
+                        "% Filtrati":          f"{pct_filt:.1f}%",
+                        "Finestre Scartate":   killed,
+                    })
+                cusum_df = pd.DataFrame(cusum_rows)
+                # Evidenzia in rosso le righe con giorni bannati
+                def _highlight_banned(row):
+                    if row["Giorni Bannati"] != "Nessuno":
+                        return ["color: #ef4444"] * len(row)
+                    return [""] * len(row)
+                st.dataframe(
+                    cusum_df.style.apply(_highlight_banned, axis=1),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("Nessun dato CUSUM disponibile.")
+
+            # ── Sezione 5: Storico allocazioni ────────────────────────────────
+            st.markdown("## \U0001f5c2\ufe0f Storico Allocazioni OOS")
+            show_cols = ["Date Closed", "Strategy", "Net PnL", "Weighted Net PnL", "Weight", "Rank",
+                         "IS Start", "OOS Start", "OOS End"]
+            if _ec_en_res:
+                show_cols += ["RiskFactor", "EC Weighted Net PnL", "EC Tracking Equity"]
+            if _sz_en_res and "Contracts" in final_oos_df.columns:
+                show_cols += ["Contracts", "Risk $", "Realized PnL $"]
+            show_cols = [c for c in show_cols if c in final_oos_df.columns]
+            st.dataframe(final_oos_df[show_cols].reset_index(drop=True), use_container_width=True)
+
+            # ── Sezione 6: Export ──────────────────────────────────────────────
+            st.markdown("## \U0001f4be Esporta Dati")
+            csv_bytes = final_oos_df[show_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="\u2b07\ufe0f Scarica CSV OOS completo",
+                data=csv_bytes, file_name="wfa_oos_results.csv", mime="text/csv",
+            )
+            if _sz_en_res:
+                st.markdown(
+                    f"**Capitale finale:** ${res.get('sizing_final_capital', _sz_cap):,.2f} "
+                    f"({'compounding attivo' if res.get('sizing_compounding') else 'nessun compounding'})"
+                )
+
+    with tab_opt:
+        render_optimizer_tab(df_raw, strategy_mapping)
