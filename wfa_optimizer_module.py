@@ -335,11 +335,11 @@ def run_wfa_single(
     all_oos_pnl: List[float] = []
 
     oos_step = pd.Timedelta(days=params.oos_days)
-    start_is = min_date
+    start_oos = min_date + relativedelta(months=params.is_months)
 
     while True:
-        end_is = start_is + relativedelta(months=params.is_months) - pd.Timedelta(days=1)
-        start_oos = end_is + pd.Timedelta(days=1)
+        start_is = start_oos - relativedelta(months=params.is_months)
+        end_is = start_oos - pd.Timedelta(days=1)
         end_oos = start_oos + pd.Timedelta(days=params.oos_days - 1)
 
         if start_oos > max_date:
@@ -349,19 +349,19 @@ def run_wfa_single(
         oos_data = df[(df[date_col] >= start_oos) & (df[date_col] <= end_oos)]
 
         if is_data.empty or oos_data.empty:
-            start_is += oos_step
+            start_oos += oos_step
             continue
 
         weights, banned_per_strat = _select_strategies(
             is_data, params, group_map, strategy_col, date_col, pnl_col
         )
         if not weights:
-            start_is += oos_step
+            start_oos += oos_step
             continue
 
         oos_sub = oos_data[oos_data[strategy_col].isin(weights.keys())].copy()
         if oos_sub.empty:
-            start_is += oos_step
+            start_oos += oos_step
             continue
 
         if has_weekday:
@@ -372,7 +372,7 @@ def run_wfa_single(
             oos_sub = oos_sub[~mask]
 
         if oos_sub.empty:
-            start_is += oos_step
+            start_oos += oos_step
             continue
 
         oos_daily = (
@@ -385,7 +385,7 @@ def run_wfa_single(
         daily_agg = oos_daily.groupby(date_col)["weighted_pnl"].sum()
         all_oos_pnl.extend(daily_agg.to_list())
 
-        start_is += oos_step
+        start_oos += oos_step
 
     if len(all_oos_pnl) < 5:
         return None
@@ -447,11 +447,11 @@ def run_wfa_single_windowed(
     window_idx = 0
 
     oos_step = pd.Timedelta(days=params.oos_days)
-    start_is = min_date
+    start_oos = min_date + relativedelta(months=params.is_months)
 
     while True:
-        end_is = start_is + relativedelta(months=params.is_months) - pd.Timedelta(days=1)
-        start_oos = end_is + pd.Timedelta(days=1)
+        start_is = start_oos - relativedelta(months=params.is_months)
+        end_is = start_oos - pd.Timedelta(days=1)
         end_oos = start_oos + pd.Timedelta(days=params.oos_days - 1)
 
         if start_oos > max_date:
@@ -461,19 +461,19 @@ def run_wfa_single_windowed(
         oos_data = df[(df[date_col] >= start_oos) & (df[date_col] <= end_oos)]
 
         if is_data.empty or oos_data.empty:
-            start_is += oos_step
+            start_oos += oos_step
             continue
 
         weights, banned_per_strat = _select_strategies(
             is_data, params, group_map, strategy_col, date_col, pnl_col
         )
         if not weights:
-            start_is += oos_step
+            start_oos += oos_step
             continue
 
         oos_sub = oos_data[oos_data[strategy_col].isin(weights.keys())].copy()
         if oos_sub.empty:
-            start_is += oos_step
+            start_oos += oos_step
             continue
 
         if has_weekday:
@@ -484,7 +484,7 @@ def run_wfa_single_windowed(
             oos_sub = oos_sub[~mask]
 
         if oos_sub.empty:
-            start_is += oos_step
+            start_oos += oos_step
             continue
 
         oos_sub = oos_sub.copy()
@@ -509,7 +509,7 @@ def run_wfa_single_windowed(
             "selected_strategies": list(weights.keys()),
         })
 
-        start_is += oos_step
+        start_oos += oos_step
 
     return windows
 
