@@ -121,6 +121,7 @@ class WFAParams:
     roc_filter_steps: int
     is_months: int = 12
     oos_days: int = 28
+    roc_steps: int = 2
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -249,7 +250,7 @@ def _select_strategies(
             continue
 
         score, higher_is_better = compute_ranking_score(
-            strat_is, params.ranking_metric, params.roc_filter_steps
+            strat_is, params.ranking_metric, params.roc_steps
         )
 
         banned_days: List[int] = []
@@ -678,6 +679,7 @@ def render_robustness_section(
             str(row["ranking_metric"]),
             bool(row["roc_filter"]),
             int(row["roc_steps"]),
+            int(row.get("roc_rank_steps", 2)),
         )
         for _, row in top20.iterrows()
     )
@@ -702,6 +704,7 @@ def render_robustness_section(
                 ranking_metric=str(row["ranking_metric"]),
                 roc_filter_enabled=bool(row["roc_filter"]),
                 roc_filter_steps=int(row["roc_steps"]),
+                roc_steps=int(row.get("roc_rank_steps", 2)),
             )
             windows = run_wfa_single_windowed(
                 df=df_processed, params=p, group_map=group_map,
@@ -1164,6 +1167,7 @@ def render_optimizer_tab(
             use_rank      = st.checkbox("ranking_metric", value=True)
             use_roc_en    = st.checkbox("roc_filter_enabled", value=True)
             use_roc_steps = st.checkbox("roc_filter_steps", value=False)
+            use_roc_rank_steps = st.checkbox("roc_steps (ranking)", value=False)
 
         with col_range:
             st.markdown("**Range / Valori**")
@@ -1175,6 +1179,7 @@ def render_optimizer_tab(
             mpg_min          = st.number_input("max_per_group min", 1, 5, 1)
             mpg_max          = st.number_input("max_per_group max", 1, 5, 3)
             roc_steps_values = st.multiselect("roc_filter_steps", [1, 2, 3, 4], [1, 2, 3])
+            roc_rank_steps_values = st.multiselect("roc_steps (ranking)", [1, 2, 3, 4], [2])
 
         with col_target:
             st.markdown("**Metrica target**")
@@ -1205,10 +1210,11 @@ def render_optimizer_tab(
     rank_range      = RANKING_METRICS                                   if use_rank      else _fixed_session("ranking_metric", DEFAULT_RANKING_METRIC)
     roc_en_range    = [True, False]                                     if use_roc_en    else _fixed_session("roc_filter_enabled", True)
     roc_steps_range = roc_steps_values or [2]                          if use_roc_steps else _fixed_session("roc_filter_steps", 2)
+    roc_rank_steps_range = roc_rank_steps_values or [2] if use_roc_rank_steps else _fixed_session("roc_steps", 2)
 
     raw_grid = list(itertools.product(
         top_n_range, fwc_range, fwp_range, bwp_range,
-        mpg_range, rank_range, roc_en_range, roc_steps_range,
+        mpg_range, rank_range, roc_en_range, roc_steps_range, roc_rank_steps_range,
     ))
     grid = [g for g in raw_grid if g[1] <= g[0]]
 
@@ -1231,7 +1237,7 @@ def render_optimizer_tab(
         t0 = time.time()
         update_every = max(1, n_combos // 200)
 
-        for idx, (tn, fwc, fwp, bwp, mpg, rm, roc_en, roc_s) in enumerate(grid):
+        for idx, (tn, fwc, fwp, bwp, mpg, rm, roc_en, roc_s, roc_rs) in enumerate(grid):
             if idx % update_every == 0 or idx == n_combos - 1:
                 p_val = (idx + 1) / n_combos
                 elapsed = time.time() - t0
@@ -1244,6 +1250,7 @@ def render_optimizer_tab(
                 max_per_group=int(mpg), ranking_metric=str(rm),
                 roc_filter_enabled=bool(roc_en), roc_filter_steps=int(roc_s),
                 is_months=int(is_months), oos_days=int(oos_days),
+                roc_steps=int(roc_rs),
             )
             metrics = run_wfa_single(
                 df=df_processed, params=params, group_map=group_map,
@@ -1257,6 +1264,7 @@ def render_optimizer_tab(
                 "full_weight_pct": params.full_weight_pct, "bench_weight_pct": params.bench_weight_pct,
                 "max_per_group": params.max_per_group, "ranking_metric": params.ranking_metric,
                 "roc_filter": params.roc_filter_enabled, "roc_steps": params.roc_filter_steps,
+                "roc_rank_steps": params.roc_steps,
             }
             row.update(metrics)
             results.append(row)
@@ -1345,6 +1353,7 @@ def render_optimizer_tab(
         st.session_state["ranking_metric"]     = str(best["ranking_metric"])
         st.session_state["roc_filter_enabled"] = bool(best["roc_filter"])
         st.session_state["roc_filter_steps"]   = int(best["roc_steps"])
+        st.session_state["roc_steps"]          = int(best.get("roc_rank_steps", 2))
         st.success("Configurazione salvata in session_state — torna alla tab principale e riesegui il WFA.")
         st.rerun()
 
