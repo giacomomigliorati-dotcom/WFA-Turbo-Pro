@@ -670,9 +670,100 @@ if uploaded_file is not None:
                 df_filtered = df_filtered.dropna(subset=['Date Opened', 'Date Closed'])
                 df_filtered['Net PnL'] = df_filtered['Net PnL'].apply(clean_money)
                 df_filtered['weekday_open'] = df_filtered['Date Opened'].dt.dayofweek
+                df_filtered = df_filtered.sort_values('Date Closed').reset_index(drop=True)
 
-                min_date   = df_filtered['Date Closed'].min()
-                max_date   = df_filtered['Date Closed'].max()
-                IS_DAYS    = 365
+                min_date  = df_filtered['Date Closed'].min()
+                max_date  = df_filtered['Date Closed'].max()
+                IS_DAYS   = 365
 
-           
+                current_oos_start = min_date + pd.DateOffset(months=12)
+                oos_results, historical_allocations, cusum_exclusions_log, roc_filter_log = [], [], [], []
+
+                # Stato EC trailing per strategia: {strat_name: equity_pura_cumulativa}
+                ec_trailing_equity: dict = {}
+
+                # Stato sizing capital (compounding)
+                current_capital = _sz_cap
+
+                while current_oos_start <= max_date:
+                    current_oos_end  = current_oos_start + pd.Timedelta(days=OOS_STEP_DAYS)
+                    current_is_start = current_oos_start - pd.DateOffset(months=12)
+                    is_data  = df_filtered[(df_filtered['Date Closed'] >= current_is_start)
+                                          & (df_filtered['Date Closed'] < current_oos_start)].copy()
+                    oos_data = df_filtered[(df_filtered['Date Closed'] >= current_oos_start)
+                                          & (df_filtered['Date Closed'] < current_oos_end)].copy()
+                    if is_data.empty:
+                        current_oos_start = current_oos_end
+                        continue
+
+                    valid_strats = is_data['Strategy'].value_counts()
+                    valid_strats = valid_strats[valid_strats >= 5].index.tolist()
+                    is_metrics = []
+
+                    for strat in valid_strats:
+                        if strat not in _sm: continue
+                        strat_is = is_data[is_data['Strategy'] == strat].copy()
+                        if _roc_fe and not passes_roc_filter(strat_is, _roc_fs):
+                            roc_filter_log.append({'OOS Start': current_oos_start, 'Strategy': strat,
+                                'Motivo': f"ROC < 0 su {_roc_fs*OOS_STEP_DAYS}gg"})
+                            continue
+                        score, higher_is_better = compute_ranking_score(strat_is, _metric, _roc_s)
+                        banned_days = compute_cusum_banned(strat_is)
+                        active_days = strat_is['weekday_open'].unique().tolist()
+                        remaining   = [d for d in active_days if d not in banned_days]
+                        if not remaining:
+                            cusum_exclusions_log.append({'OOS Start': current_oos_start, 'Strategy': strat,
+                                'Motivo': f"Tutti i giorni bannati: {format_banned_days(banned_days)}"})
+                            continue
+
+                        # Calcola percentili DD IS (sempre, usati solo se EC attivo)
+                        dd_thresholds = compute_dd_percentiles_from_is(
+                            strat_is, p80=_ec_p80, p90=_ec_p90, p95=_ec_p95
+                        ) if _ec_en else {}
+
+                        is_metrics.append({'Strategy': strat, 'Group': _sm[strat],
+                            'Score': score, 'Higher_is_better': higher_is_better,
+                            'Net PnL IS': strat_is['Net PnL'].sum(), 'Banned Days': banned_days,
+                            'DD Thresholds': dd_thresholds})
+
+                    is_metrics_df = pd.DataFrame(is_metrics)
+                    if not is_metrics_df.empty:
+                        asc = False if is_metrics_df['Higher_is_better'].all() else True
+                        is_metrics_df = is_metrics_df.sort_values(['Score','Net PnL IS'], ascending=[asc, False])
+                        selected_strategies, group_counts = [], {}
+                        for _, row in is_metrics_df.iterrows():
+                            if len(selected_strategies) >= _top_n: break
+                            grp = row['Group']
+                            if group_counts.get(grp, 0) < _mpg:
+                                selected_strategies.append(row)
+                                group_counts[grp] = group_counts.get(grp, 0) + 1
+
+                        window_oos_chunks = []  # raccoglie df OOS per compounding sizing
+
+                        for rank, strat_row in enumerate(selected_strategies):
+                            weight     = _fwp if rank < _fwc else _bwp
+                            strat_name = strat_row['Strategy']
+                            banned     = strat_row['Banned Days']
+                            dd_thresh  = strat_row['DD Thresholds']
+                            historical_allocations.append({
+                                'OOS Start': current_oos_start, 'OOS End': current_oos_end,
+                                'Rank': rank + 1, 'Strategy': strat_name, 'Group': strat_row['Group'],
+                                'Score IS': round(strat_row['Score'], 4), 'Metric': _metric,
+                                'Weight': weight, 'Banned Days': banned,
+                                'Top-N': _top_n, 'Max Per Group': _mpg,
+                            })
+                            strat_oos = oos_data[oos_data['Strategy'] == strat_name].copy()
+                            if strat_oos.empty:
+                                continue
+                            strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned)].copy()
+                            if strat_oos.empty:
+                                continue
+                            strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
+                            strat_oos['Weight'] = weight
+
+                            # ── Equity Control ──────────────────────────────
+                            if _ec_en and dd_thresh:
+                                start_eq = ec_trailing_equity.get(strat_name, 0.0) if _ec_mode == "Trailing" else 0.0
+                                strat_oos = apply_equity_control(
+                                    strat_oos, dd_thresh,
+                    
