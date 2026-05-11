@@ -592,4 +592,87 @@ if uploaded_file is not None:
     full_weight_count = int(st.session_state["full_weight_count"])
     full_weight_pct   = int(st.session_state["full_weight_pct"])
     bench_weight_pct  = int(st.session_state["bench_weight_pct"])
-    max_per_group     = int(st.session_state["max_per_group"]
+    max_per_group     = int(st.session_state["max_per_group"])
+    ranking_metric    = st.session_state["ranking_metric"]
+    roc_steps         = int(st.session_state["roc_steps"])
+    roc_filter_enabled= bool(st.session_state["roc_filter_enabled"])
+    roc_filter_steps  = int(st.session_state["roc_filter_steps"])
+    bench_count       = top_n - full_weight_count
+    ec_enabled        = bool(st.session_state["ec_enabled"])
+    ec_capital_mode   = st.session_state["ec_capital_mode"]
+    ec_p80            = int(st.session_state["ec_p80"])
+    ec_p90            = int(st.session_state["ec_p90"])
+    ec_p95            = int(st.session_state["ec_p95"])
+    sizing_enabled            = bool(st.session_state["sizing_enabled"])
+    sizing_initial_capital    = float(st.session_state["sizing_initial_capital"])
+    sizing_max_daily_loss_pct = float(st.session_state["sizing_max_daily_loss_pct"])
+    sizing_compounding        = bool(st.session_state["sizing_compounding"])
+    sizing_strategy_configs   = st.session_state.get("sizing_strategy_configs", {})
+
+    tab_wfa, tab_opt = st.tabs(["\U0001f4ca Walk-Forward", "\u2699\ufe0f Ottimizzatore"])
+
+    with tab_wfa:
+        st.markdown("---")
+        col_launch, col_info = st.columns([3, 7])
+        with col_launch:
+            launch = st.button("\u25b6 Lancia simulazione WFA", type="primary", use_container_width=True)
+        with col_info:
+            roc_filter_label = (
+                f" &nbsp;|&nbsp; \U0001f6ab ROC filter: <b style='color:#ef4444'>{roc_filter_steps*OOS_STEP_DAYS}gg</b>"
+            ) if roc_filter_enabled else ""
+            ec_label = (
+                f" &nbsp;|&nbsp; \U0001f4c9 EC: <b style='color:#22c55e'>{ec_capital_mode}</b>"
+            ) if ec_enabled else ""
+            sizing_label = (
+                f" &nbsp;|&nbsp; \U0001f4b0 Sizing: <b style='color:#f59e0b'>ON</b>"
+                f" | Capital: <b style='color:#f59e0b'>${sizing_initial_capital:,.0f}</b>"
+                f" | MaxDD: <b style='color:#f59e0b'>{sizing_max_daily_loss_pct:.1f}%</b>"
+            ) if sizing_enabled else ""
+            ranking_label_color = "#f59e0b" if ranking_metric != "Omega Ratio" else "#00d4ff"
+            st.markdown(
+                f"<div style='padding-top:10px; color:#7a9abf; font-size:0.88rem;'>"
+                f"Ranking: <b style='color:{ranking_label_color}'>{ranking_metric}</b>"
+                + (f" ({roc_steps*OOS_STEP_DAYS}gg)" if ranking_metric == "ROC" else "")
+                + f" &nbsp;|&nbsp; Top-N: <b style='color:#00d4ff'>{top_n}</b>"
+                f" &nbsp;|&nbsp; Pesi: <b style='color:#00d4ff'>{full_weight_count}\u00d7{full_weight_pct}%</b>"
+                f" + <b style='color:#f59e0b'>{bench_count}\u00d7{bench_weight_pct}%</b>"
+                f" &nbsp;|&nbsp; Max/gr: <b style='color:#00d4ff'>{max_per_group}</b>"
+                + roc_filter_label + ec_label + sizing_label + "</div>",
+                unsafe_allow_html=True
+            )
+
+        if launch:
+            _top_n   = top_n
+            _fwc     = full_weight_count
+            _fwp     = full_weight_pct / 100.0
+            _bwp     = bench_weight_pct / 100.0
+            _mpg     = max_per_group
+            _sm      = dict(strategy_mapping)
+            _metric  = ranking_metric
+            _roc_s   = roc_steps
+            _roc_fe  = roc_filter_enabled
+            _roc_fs  = roc_filter_steps
+            _ec_en   = ec_enabled
+            _ec_mode = ec_capital_mode
+            _ec_p80  = ec_p80
+            _ec_p90  = ec_p90
+            _ec_p95  = ec_p95
+            _sz_en   = sizing_enabled
+            _sz_cap  = sizing_initial_capital
+            _sz_mdl  = sizing_max_daily_loss_pct
+            _sz_comp = sizing_compounding
+            _sz_cfgs = dict(sizing_strategy_configs)
+
+            with st.spinner("Elaborazione Walk-Forward in corso..."):
+                df_filtered = df_raw.copy()
+                df_filtered['Date Opened'] = pd.to_datetime(df_filtered['Date Opened'], dayfirst=True, errors='coerce')
+                df_filtered['Date Closed'] = pd.to_datetime(df_filtered['Date Closed'], dayfirst=True, errors='coerce')
+                df_filtered = df_filtered.dropna(subset=['Date Opened', 'Date Closed'])
+                df_filtered['Net PnL'] = df_filtered['Net PnL'].apply(clean_money)
+                df_filtered['weekday_open'] = df_filtered['Date Opened'].dt.dayofweek
+
+                min_date   = df_filtered['Date Closed'].min()
+                max_date   = df_filtered['Date Closed'].max()
+                IS_DAYS    = 365
+
+           
