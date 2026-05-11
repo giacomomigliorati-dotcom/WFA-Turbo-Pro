@@ -695,10 +695,30 @@ if uploaded_file is not None:
                     - df_filtered['Closing Commissions + Fees']
                 )
                 df_filtered = df_filtered.sort_values('Date Closed').reset_index(drop=True)
+
+                if ec_enabled:
+                    dd_thresholds = {}
+                    for strat, strat_hist in df_filtered.groupby("Strategy"):
+                        dd_thresholds[strat] = compute_dd_percentiles_from_is(
+                            strat_hist,
+                            p80=ec_p80,
+                            p90=ec_p90,
+                            p95=ec_p95,
+                        )
+                else:
+                    dd_thresholds = {}
+
                 min_date  = df_filtered['Date Closed'].min()
                 max_date  = df_filtered['Date Closed'].max()
                 current_oos_start = min_date + pd.DateOffset(months=12)
                 oos_results, historical_allocations, cusum_exclusions_log, roc_filter_log = [], [], [], []
+                equity_state = {}
+                sizing_params = PortfolioSizingParams(
+                    initial_capital=sizing_initial_capital,
+                    max_daily_loss_pct=sizing_max_daily_loss_pct,
+                    compounding=sizing_compounding,
+                )
+                current_capital = sizing_params.initial_capital
 
                 while current_oos_start <= max_date:
                     current_oos_end  = current_oos_start + pd.Timedelta(days=OOS_STEP_DAYS)
@@ -739,6 +759,7 @@ if uploaded_file is not None:
                         asc = False if is_metrics_df['Higher_is_better'].all() else True
                         is_metrics_df = is_metrics_df.sort_values(['Score','Net PnL IS'], ascending=[asc, False])
                         selected_strategies, group_counts = [], {}
+                        window_realized = 0.0
                         for _, row in is_metrics_df.iterrows():
                             if len(selected_strategies) >= _top_n: break
                             grp = row['Group']
@@ -759,8 +780,50 @@ if uploaded_file is not None:
                             strat_oos = oos_data[oos_data['Strategy'] == strat_name].copy()
                             if not strat_oos.empty:
                                 strat_oos = strat_oos[~strat_oos['weekday_open'].isin(banned)]
+                                start_eq = 0.0
+                                if ec_enabled and ec_capital_mode == "Trailing":
+                                    start_eq = equity_state.get(strat_name, 0.0)
                                 strat_oos['Weighted Net PnL'] = strat_oos['Net PnL'] * weight
+                                strat_oos['Weight'] = weight
+
+                                if ec_enabled:
+                                    thresholds = dd_thresholds.get(strat_name)
+                                    if thresholds is not None:
+                                        strat_oos_ec = apply_equity_control(
+                                            strat_oos,
+                                            thresholds=thresholds,
+                                            capital_mode=ec_capital_mode,
+                                            start_equity=start_eq,
+                                        )
+                                        strat_oos_ec["Weighted Net PnL Raw"] = strat_oos_ec["Weighted Net PnL"]
+                                        strat_oos_ec["Weighted Net PnL"] = strat_oos_ec["EC Weighted Net PnL"]
+                                        if ec_capital_mode == "Trailing":
+                                            if "EC Tracking Equity" in strat_oos_ec.columns and not strat_oos_ec.empty:
+                                                equity_state[strat_name] = float(strat_oos_ec["EC Tracking Equity"].iloc[-1])
+                                        strat_oos = strat_oos_ec
+
+                                if sizing_enabled:
+                                    cfg_dict = sizing_strategy_configs.get(strat_name, {})
+                                    sizing_cfg = StrategySizingConfig(
+                                        cap_pct=cfg_dict.get("cap_pct", DEFAULT_CAP_PCT),
+                                        sl_usd=cfg_dict.get("sl_usd", DEFAULT_SL_USD),
+                                        sl_pct=cfg_dict.get("sl_pct", DEFAULT_SL_PCT),
+                                    )
+
+                                    strat_oos = apply_portfolio_sizing(
+                                        strat_oos,
+                                        sizing_cfg=sizing_cfg,
+                                        capital=current_capital,
+                                        max_daily_loss_pct=sizing_params.max_daily_loss_pct,
+                                    )
+                                    strat_oos["Weighted Net PnL PreSizing"] = strat_oos["Weighted Net PnL"]
+                                    strat_oos["Weighted Net PnL"] = strat_oos["Realized PnL $"]
+                                    window_realized += float(strat_oos["Realized PnL $"].sum())
+
                                 oos_results.append(strat_oos)
+
+                        if sizing_enabled and sizing_params.compounding:
+                            current_capital = max(0.0, current_capital + window_realized)
                     current_oos_start = current_oos_end
 
             if not oos_results:
