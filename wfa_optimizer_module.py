@@ -333,6 +333,7 @@ def run_wfa_single(
     min_date = df[date_col].min()
     max_date = df[date_col].max()
     all_oos_pnl: List[float] = []
+    all_oos_dates: List[pd.Timestamp] = []
 
     oos_step = pd.Timedelta(days=params.oos_days)
     start_oos = min_date + relativedelta(months=params.is_months)
@@ -384,6 +385,7 @@ def run_wfa_single(
         )
         daily_agg = oos_daily.groupby(date_col)["weighted_pnl"].sum()
         all_oos_pnl.extend(daily_agg.to_list())
+        all_oos_dates.extend(daily_agg.index.to_list())
 
         start_oos += oos_step
 
@@ -396,13 +398,18 @@ def run_wfa_single(
     sharpe = (mean_p / (std_p or 1e-9)) * math.sqrt(252)
 
     neg = pnl[pnl < 0]
-    dstd = float(np.std(neg)) if neg.size > 1 else 0.0
+    dstd = float(np.std(neg, ddof=1)) if neg.size > 1 else 0.0
     sortino = (mean_p / (dstd or 1e-9)) * math.sqrt(252)
 
     total_pnl = float(np.sum(pnl))
     max_dd = _max_drawdown(pnl)
-    calmar = (total_pnl / (max_dd or 1e-9)) if max_dd > 0 else 0.0
-    recovery = (total_pnl / (max_dd or 1e-9)) if max_dd > 0 else 0.0
+    if all_oos_dates:
+        cal_days = (max(all_oos_dates) - min(all_oos_dates)).days
+    else:
+        cal_days = int(pnl.size)
+    annualized_pnl = total_pnl * (365.25 / max(cal_days, 1))
+    calmar = (annualized_pnl / max_dd) if max_dd > 0 else 0.0
+    recovery = (total_pnl / max_dd) if max_dd > 0 else 0.0
 
     return {
         "sharpe":          round(sharpe, 2),
