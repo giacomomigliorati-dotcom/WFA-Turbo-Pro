@@ -699,7 +699,8 @@ if uploaded_file is not None:
                 # Struttura:
                 #   cusum_log[sn] = {
                 #       "banned_freq":   Counter({day_idx: n_finestre_in_cui_e_stato_bannato}),
-                #       "last_banned":   lista giorni bannati nell'ultima finestra IS in cui la strategia è apparsa,
+                #       "last_banned":   lista giorni bannati nell'ultima finestra IS in cui la strategia ha dati
+                #                        (aggiornato per TUTTE le strategie con gruppo, non solo quelle nel ranking),
                 #       "oos_before":    int  (trade OOS cumulativi prima del filtro),
                 #       "oos_after":     int  (trade OOS cumulativi dopo il filtro),
                 #       "fully_killed":  int  (n. finestre in cui tutti i trade OOS erano bannati),
@@ -730,6 +731,17 @@ if uploaded_file is not None:
                             ec_thresholds_by_strat[sn] = compute_dd_percentiles_from_is(
                                 strat_is, _ec_p80, _ec_p90, _ec_p95
                             )
+
+                        # ── Aggiorna last_banned per TUTTE le strategie IS (indipendentemente dal ranking) ──
+                        if sn not in cusum_log:
+                            cusum_log[sn] = {
+                                "banned_freq":  Counter(),
+                                "last_banned":  [],
+                                "oos_before":   0,
+                                "oos_after":    0,
+                                "fully_killed": 0,
+                            }
+                        cusum_log[sn]["last_banned"] = cusum_banned_by_strat[sn]
 
                     if not strategy_scores:
                         continue
@@ -769,20 +781,9 @@ if uploaded_file is not None:
 
                         oos_after = len(strat_oos)
 
-                        # ── Accumula nel log CUSUM ──
-                        if sn not in cusum_log:
-                            cusum_log[sn] = {
-                                "banned_freq":  Counter(),  # quante finestre ogni giorno è stato bannato
-                                "last_banned":  [],          # giorni bannati nell'ultima IS in cui la strategia appare
-                                "oos_before":   0,
-                                "oos_after":    0,
-                                "fully_killed": 0,
-                            }
-                        # Frequenza storica: incrementa il contatore per ogni giorno bannato in questa finestra
+                        # ── Accumula statistiche OOS nel log CUSUM (solo per strategie nel ranking) ──
                         for day_idx in banned_days:
                             cusum_log[sn]["banned_freq"][day_idx] += 1
-                        # Giorni bannati attivi = quelli dell'ultima finestra IS in cui la strategia appare
-                        cusum_log[sn]["last_banned"]  = banned_days
                         cusum_log[sn]["oos_before"]  += oos_before
                         cusum_log[sn]["oos_after"]   += oos_after
 
@@ -868,7 +869,11 @@ if uploaded_file is not None:
             latest_window_end = final_oos_df["OOS End"].max()
             latest_alloc = final_oos_df[final_oos_df["OOS End"] == latest_window_end].copy()
             latest_alloc = latest_alloc.drop_duplicates(subset=["Strategy"])
-            display_cols = ["Strategy", "Rank", "Weight", "RiskFactor"]
+            # Aggiungi colonna giorni bannati dal CUSUM (last_banned aggiornato per tutte le IS)
+            latest_alloc["Giorni Bannati (CUSUM)"] = latest_alloc["Strategy"].apply(
+                lambda s: format_banned_days(cusum_log.get(s, {}).get("last_banned", []))
+            )
+            display_cols = ["Strategy", "Rank", "Weight", "RiskFactor", "Giorni Bannati (CUSUM)"]
             if _sz_en_res and "Contracts" in latest_alloc.columns:
                 display_cols += ["Contracts", "Risk $"]
             st.dataframe(latest_alloc[display_cols].reset_index(drop=True), use_container_width=True)
@@ -919,7 +924,8 @@ if uploaded_file is not None:
             # ── Sezione 4: CUSUM Weekday Killer ─────────────────────────────────────────────
             st.markdown("## \U0001f5d3\ufe0f CUSUM Weekday Killer")
             st.caption(
-                "**Giorni Bannati (ultima IS)**: giorni effettivamente bannati nell'ultima finestra IS — operativi adesso. "
+                "**Giorni Bannati (ultima IS)**: giorni bannati nell'ultima finestra IS in cui la strategia ha dati — "
+                "aggiornato per tutte le strategie indipendentemente dal ranking. "
                 "**Frequenza Storica Ban**: quante finestre IS ogni giorno è stato bannato nel corso dell'intera simulazione."
             )
             if cusum_log:
