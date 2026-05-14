@@ -23,6 +23,12 @@ Ogni giorno viene inizializzato con un budget massimo di rischio
 pari a max_daily_loss_pct% del capitale corrente. I contratti di ogni
 trade vengono clampati in modo che il rischio complessivo della giornata
 non superi il budget residuo. Il budget si azzera a mezzanotte (data).
+
+Stop-loss percentuale
+---------------------
+sl_pct esprime la percentuale del premio di apertura usata come SL.
+Può essere maggiore di 100 (es. 150 = 1.5× il premio).
+Priorità: sl_pct > 0 ha precedenza su sl_usd.
 """
 
 from __future__ import annotations
@@ -40,8 +46,8 @@ DEFAULT_INITIAL_CAPITAL       = 100_000.0   # USD
 DEFAULT_MAX_DAILY_LOSS_PCT    = 2.0         # % del capitale
 DEFAULT_COMPOUNDING           = True
 DEFAULT_CAP_PCT               = 5.0         # % capitale max per strategia
-DEFAULT_SL_USD                = 200.0       # stop-loss per contratto (USD)
-DEFAULT_SL_PCT                = 0.0         # stop-loss come % del premio (0 = disabilitato)
+DEFAULT_SL_USD                = 0.0         # stop-loss per contratto (USD); 0 = disabilitato
+DEFAULT_SL_PCT                = 0.0         # stop-loss come % del premio (0 = disabilitato); può essere > 100
 
 # Soglie regola bench + EC
 BENCH_WEIGHT_THRESHOLD        = 0.79        # weight_wfa <= questa soglia = panchina
@@ -54,13 +60,13 @@ EC_RF_BENCH_CUTOFF            = 0.50        # RF <= questa soglia + panchina = s
 class StrategySizingConfig:
     """Parametri di sizing specifici per una singola strategia."""
     cap_pct: float = DEFAULT_CAP_PCT      # % capitale max da allocare
-    sl_usd:  float = DEFAULT_SL_USD       # stop-loss per contratto in USD
-    sl_pct:  float = DEFAULT_SL_PCT       # stop-loss come % del premio (0 = usa sl_usd)
+    sl_usd:  float = DEFAULT_SL_USD       # stop-loss per contratto in USD (0 = disabilitato)
+    sl_pct:  float = DEFAULT_SL_PCT       # stop-loss come % del premio (0 = disabilitato; accetta valori > 100)
 
     def __post_init__(self):
         self.cap_pct = max(0.1, min(100.0, float(self.cap_pct)))
-        self.sl_usd  = max(1.0, float(self.sl_usd))
-        self.sl_pct  = max(0.0, float(self.sl_pct))
+        self.sl_usd  = max(0.0, float(self.sl_usd))
+        self.sl_pct  = max(0.0, float(self.sl_pct))  # nessun limite superiore: accetta multipli del premio
 
 
 @dataclass
@@ -109,11 +115,15 @@ def _sl_per_contract(
 
     Priorità:
     1. sl_pct > 0  →  sl_unit = premium * sl_pct / 100
+                      (sl_pct può essere > 100, es. 150 = 1.5× il premio)
     2. sl_usd > 0  →  sl_unit = sl_usd
+    3. entrambi = 0 →  ritorna 0.0 (sizing disabilitato)
     """
     if sizing_cfg.sl_pct > 0.0 and premium > 0.0:
         return premium * sizing_cfg.sl_pct / 100.0
-    return max(1.0, sizing_cfg.sl_usd)
+    if sizing_cfg.sl_usd > 0.0:
+        return sizing_cfg.sl_usd
+    return 0.0
 
 
 def compute_contracts(
