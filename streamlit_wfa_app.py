@@ -949,13 +949,41 @@ if uploaded_file is not None:
             equity_csv_df = pd.DataFrame({
                 'Date': all_cum.index, 'Daily PnL': all_daily.values, 'Cumulative PnL': all_cum.values})
 
+            # ── SEZIONE 5b: Position Sizing per step OOS ─────────────────────────────────
+            if sizing_enabled and not final_oos_df.empty:
+                st.header("5b. Position Sizing per Step OOS")
+                st.caption("Contratti allocati, rischio impegnato e PnL realizzato per ogni trade OOS con sizing attivo.")
+
+                sizing_cols = [c for c in ["Date Closed", "Strategy", "Weight", "RiskFactor",
+                                            "Contracts", "Risk $", "Realized PnL $", "Net PnL"]
+                               if c in final_oos_df.columns]
+                sizing_view = final_oos_df[sizing_cols].copy()
+
+                if "Weight" in sizing_view.columns:
+                    sizing_view["Weight"] = (sizing_view["Weight"] * 100).round(0).astype(int).astype(str) + "%"
+                if "RiskFactor" in sizing_view.columns:
+                    sizing_view["RiskFactor"] = sizing_view["RiskFactor"].map(
+                        lambda x: f"{int(x*100)}%" if pd.notna(x) else "\u2014"
+                    )
+                if "Risk $" in sizing_view.columns:
+                    sizing_view["Risk $"] = sizing_view["Risk $"].map(lambda x: f"${x:,.2f}")
+                if "Realized PnL $" in sizing_view.columns:
+                    sizing_view["Realized PnL $"] = sizing_view["Realized PnL $"].map(lambda x: f"${x:,.2f}")
+
+                st.dataframe(sizing_view, use_container_width=True, hide_index=True)
+
             col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
             with col_b1:
                 st.download_button("\U0001f4e5 Allocazioni Storiche",
                     data=hist_export.to_csv(index=False).encode('utf-8'), file_name="wfa_allocations.csv", mime="text/csv")
             with col_b2:
+                oos_export = final_oos_df.copy()
+                if "Banned Days" in oos_export.columns:
+                    oos_export["Banned Days"] = oos_export["Banned Days"].apply(
+                        lambda x: format_banned_days(x) if isinstance(x, list) else x
+                    )
                 st.download_button("\U0001f4e5 Trade OOS Filtrati",
-                    data=final_oos_df.to_csv(index=False).encode('utf-8'), file_name="wfa_oos_trades.csv", mime="text/csv")
+                    data=oos_export.to_csv(index=False).encode('utf-8'), file_name="wfa_oos_trades.csv", mime="text/csv")
             with col_b3:
                 st.download_button("\U0001f4e5 Equity Line Completa",
                     data=equity_csv_df.to_csv(index=False).encode('utf-8'), file_name="equity_full.csv", mime="text/csv")
