@@ -266,6 +266,7 @@ def build_config_payload():
         "sizing_max_daily_loss_pct": float(st.session_state.get("sizing_max_daily_loss_pct",DEFAULT_MAX_DAILY_LOSS_PCT)),
         "sizing_compounding":        bool(st.session_state.get("sizing_compounding",         DEFAULT_COMPOUNDING)),
         "sizing_strategy_configs":   st.session_state.get("sizing_strategy_configs",         {}),
+        "disabled_strategies":       list(st.session_state.get("disabled_strategies", [])),  # ← AGGIUNTO
     }
 
 def apply_config_payload(payload, all_strategies):
@@ -304,6 +305,8 @@ def apply_config_payload(payload, all_strategies):
     st.session_state["sizing_compounding"]        = bool(payload.get("sizing_compounding",         DEFAULT_COMPOUNDING))
     raw_cfgs = payload.get("sizing_strategy_configs", {})
     st.session_state["sizing_strategy_configs"] = raw_cfgs if isinstance(raw_cfgs, dict) else {}
+    raw_disabled = payload.get("disabled_strategies", [])
+    st.session_state["disabled_strategies"] = [str(s) for s in raw_disabled if isinstance(s, str)]
 
 # ─── INIT SESSION STATE ───────────────────────────────────────────────────────
 _SS_DEFAULTS = {
@@ -326,6 +329,7 @@ _SS_DEFAULTS = {
     "sizing_compounding":        DEFAULT_COMPOUNDING,
     "sizing_strategy_configs":   {},
     "max_per_group":      DEFAULT_MAX_PER_GROUP,
+    "disabled_strategies": [],   # ← AGGIUNTO
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -604,6 +608,16 @@ if uploaded_file is not None:
             st.sidebar.success("Assegnazioni aggiornate \u2014 esporta il JSON!")
             st.rerun()
 
+    st.sidebar.divider()
+    st.sidebar.subheader("🚫 Strategie disabilitate")
+    st.sidebar.caption("Le strategie selezionate saranno escluse dall'analisi WFA.")
+    st.sidebar.multiselect(
+        "Disabilita strategie",
+        options=all_strategies_in_file,
+        default=st.session_state.get("disabled_strategies", []),
+        key="disabled_strategies",
+    )
+    
     strategy_mapping = st.session_state['strategy_mapping']
     still_unmapped = [s for s in all_strategies_in_file if not strategy_mapping.get(s, '').strip()]
     if still_unmapped:
@@ -681,6 +695,10 @@ if uploaded_file is not None:
 
             with st.spinner("Elaborazione Walk-Forward in corso..."):
                 df_filtered = df_raw.copy()
+                _disabled = st.session_state.get("disabled_strategies", [])
+                if _disabled:
+                    df_filtered = df_filtered[~df_filtered['Strategy'].isin(_disabled)]
+                df_filtered['Date Opened'] = pd.to_datetime(df_filtered['Date Opened'])
                 df_filtered['Date Opened'] = pd.to_datetime(df_filtered['Date Opened'])
                 df_filtered['Date Closed'] = pd.to_datetime(df_filtered['Date Closed'])
                 df_filtered['weekday_open'] = df_filtered['Date Opened'].dt.weekday
@@ -988,6 +1006,10 @@ if uploaded_file is not None:
             ):
                 with st.spinner("Calcolo finestre OOS per il dettaglio..."):
                     _df_for_detail = df_raw.copy()
+                    _disabled = st.session_state.get("disabled_strategies", [])
+                    if _disabled:
+                        _df_for_detail = _df_for_detail[~_df_for_detail["Strategy"].isin(_disabled)]
+                    _df_for_detail["Date Opened"] = pd.to_datetime(_df_for_detail["Date Opened"])
                     _df_for_detail["Date Opened"] = pd.to_datetime(_df_for_detail["Date Opened"])
                     _df_for_detail["Date Closed"] = pd.to_datetime(_df_for_detail["Date Closed"])
                     _df_for_detail["weekday_open"] = _df_for_detail["Date Opened"].dt.weekday
@@ -1156,6 +1178,10 @@ if uploaded_file is not None:
     # ─── TAB OTTIMIZZATORE ────────────────────────────────────────────────────
     with tab_opt:
         df_opt = df_raw.copy()
+        _disabled = st.session_state.get("disabled_strategies", [])
+        if _disabled:
+            df_opt = df_opt[~df_opt['Strategy'].isin(_disabled)].copy()
+        df_opt['Date Closed'] = pd.to_datetime(df_opt['Date Closed'])
         df_opt['Date Closed'] = pd.to_datetime(df_opt['Date Closed'])
         df_opt['Date Opened'] = pd.to_datetime(df_opt['Date Opened'])
         df_opt['P/L'] = df_opt['P/L'].apply(clean_money)
