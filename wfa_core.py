@@ -428,3 +428,556 @@ def apply_portfolio_sizing(
     df["Risk $"]         = risk_list
     df["Realized PnL $"] = realized_list
     return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SANITY CHECK / EQUITY CONTROL RULES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _normalize_weekday_name(weekday):
+    if pd.isna(weekday):
+        return None
+    if isinstance(weekday, (int, float)) and not isinstance(weekday, bool):
+        try:
+            return GIORNI_SETTIMANA[int(weekday)]
+        except Exception:
+            return str(int(weekday))
+    return str(weekday)
+
+
+def _compute_profit_factor(pnl_series: pd.Series) -> float:
+    wins = pnl_series[pnl_series > 0].sum()
+    losses = pnl_series[pnl_series < 0].sum()
+    if losses == 0:
+        return float(np.inf) if wins > 0 else 0.0
+    return float(wins / abs(losses))
+
+
+def _compute_equity_drawdown(pnl_series: pd.Series):
+    daily = pnl_series.groupby(pnl_series.index).sum().sort_index()
+    cum = daily.cumsum()
+    peak = cum.cummax()
+    dd = peak - cum
+    max_dd = float(dd.max()) if not dd.empty else 0.0
+    current_dd = float(dd.iloc[-1]) if not dd.empty else 0.0
+    return current_dd, max_dd, dd
+
+
+def rule_dd_equity_control_strategy(
+    final_oos_df: pd.DataFrame,
+    ec_enabled: bool,
+    ec_capital_mode: str,
+    ec_p80: float,
+    ec_p90: float,
+    ec_p95: float,
+    thresholds_by_strategy=None,
+):
+    """Assegna uno stato strategy-level usando la logica dei percentili DD."""
+    if final_oos_df is None or final_oos_df.empty:
+        return pd.DataFrame(columns=[
+            'Strategy', 'state', 'reason', 'dd_current', 'dd_max',
+            'dd_p80', 'dd_p90', 'dd_p95', 'n_days', 'reliable', 'warning',
+            'trade_count', 'total_pnl',
+        ])
+
+    rows = []
+    for strat, group in final_oos_df.groupby('Strategy'):
+        strat_name = str(strat)
+        df = group.sort_values('Date Closed')
+        if ec_enabled and 'EC Weighted Net PnL' in df.columns:
+            pnl_col = 'EC Weighted Net PnL'
+        else:
+            pnl_col = 'Weighted Net PnL'
+
+        daily_pnl = df.groupby(df['Date Closed'].dt.date)[pnl_col].sum().astype(float)
+        equity = daily_pnl.cumsum()
+        peak = equity.cummax()
+        dd_series = peak - equity
+        dd_current = float(dd_series.iloc[-1]) if not dd_series.empty else 0.0
+        dd_max = float(dd_series.max()) if not dd_series.empty else 0.0
+
+        thresholds = None
+        if thresholds_by_strategy and strat_name in thresholds_by_strategy:
+            thresholds = thresholds_by_strategy[strat_name]
+        else:
+            thresholds = compute_dd_percentiles_from_is(
+                df.rename(columns={pnl_col: 'Net PnL'}),
+                p80=int(ec_p80), p90=int(ec_p90), p95=int(ec_p95)
+            )
+        dd_p80 = float(thresholds.get('dd_p80', 0.0))
+        dd_p90 = float(thresholds.get('dd_p90', 0.0))
+        dd_p95 = float(thresholds.get('dd_p95', 0.0))
+
+        if dd_current < dd_p80:
+            state = 'healthy'
+            reason = f"DD corrente {dd_current:.2f} < P80 {dd_p80:.2f}"
+        elif dd_current < dd_p90:
+            state = 'monitor'
+            reason = f"DD corrente {dd_current:.2f} >= P80 {dd_p80:.2f}"
+        elif dd_current >= dd_p95:
+            state = 'inhibited'
+            reason = f"DD corrente {dd_current:.2f} >= P95 {dd_p95:.2f}"
+        else:
+            state = 'monitor'
+            reason = f"DD corrente {dd_current:.2f} in [P90,P95)"
+
+        rows.append({
+            'Strategy': strat_name,
+            'state': state,
+            'reason': reason,
+            'dd_current': dd_current,
+            'dd_max': dd_max,
+            'dd_p80': dd_p80,
+            'dd_p90': dd_p90,
+            'dd_p95': dd_p95,
+            'n_days': int(len(daily_pnl)),
+            'reliable': bool(thresholds.get('reliable', False)),
+            'warning': thresholds.get('warning'),
+            'trade_count': int(len(df)),
+            'total_pnl': float(df[pnl_col].sum()),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def rule_weekday_performance(
+    final_oos_df: pd.DataFrame,
+    trade_count_threshold: int = 20,
+    max_dd_ratio_monitor: float = 0.40,
+) -> pd.DataFrame:
+    """Assegna uno stato a ogni coppia Strategy × weekday basato sulla performance storica."""
+    if final_oos_df is None or final_oos_df.empty:
+        return pd.DataFrame(columns=[
+            'Strategy', 'weekday_open', 'state', 'reason',
+            'trade_count', 'total_pnl', 'avg_pnl', 'profit_factor', 'max_dd',
+        ])
+
+    rows = []
+    df = final_oos_df.copy()
+    df['weekday_open'] = df['weekday_open'].apply(_normalize_weekday_name)
+    for (strat, wd), group in df.groupby(['Strategy', 'weekday_open']):
+        group = group.sort_values('Date Closed')
+        trade_count = len(group)
+        total_pnl = float(group['Weighted Net PnL'].sum())
+        avg_pnl = float(group['Weighted Net PnL'].mean()) if trade_count else 0.0
+        profit_factor = _compute_profit_factor(group['Weighted Net PnL'])
+
+        daily_pnl = group.groupby(group['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+        cum = daily_pnl.cumsum()
+        max_dd = float((cum.cummax() - cum).max()) if not daily_pnl.empty else 0.0
+
+        if trade_count >= trade_count_threshold and profit_factor < 0.8 and total_pnl < 0:
+            state = 'inhibited'
+            reason = (
+                f"PF {profit_factor:.2f} < 0.8 e PnL {total_pnl:.2f} negativo su {trade_count} trade"
+            )
+        elif profit_factor < 1.0 or (abs(total_pnl) > 0 and max_dd > abs(total_pnl) * max_dd_ratio_monitor):
+            state = 'monitor'
+            reason = (
+                f"PF {profit_factor:.2f} < 1.0 o DD {max_dd:.2f} elevato per weekday"
+            )
+        else:
+            state = 'healthy'
+            reason = f"PF {profit_factor:.2f} e PnL {total_pnl:.2f}"
+
+        rows.append({
+            'Strategy': str(strat),
+            'weekday_open': wd,
+            'state': state,
+            'reason': reason,
+            'trade_count': int(trade_count),
+            'total_pnl': total_pnl,
+            'avg_pnl': avg_pnl,
+            'profit_factor': profit_factor,
+            'max_dd': max_dd,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def rule_rolling_underperf_strategy(
+    final_oos_df: pd.DataFrame,
+    rolling_trades: int = 20,
+) -> pd.DataFrame:
+    """Segnala strategie con underperformance recente sugli ultimi N trade."""
+    if final_oos_df is None or final_oos_df.empty:
+        return pd.DataFrame(columns=[
+            'Strategy', 'state', 'reason',
+            'rolling_trade_count', 'total_pnl', 'avg_pnl', 'profit_factor', 'max_dd',
+        ])
+
+    rows = []
+    for strat, group in final_oos_df.groupby('Strategy'):
+        group = group.sort_values('Date Closed')
+        if len(group) < rolling_trades:
+            continue
+        recent = group.tail(rolling_trades)
+        trade_count = len(recent)
+        total_pnl = float(recent['Weighted Net PnL'].sum())
+        avg_pnl = float(recent['Weighted Net PnL'].mean())
+        profit_factor = _compute_profit_factor(recent['Weighted Net PnL'])
+        daily_pnl = recent.groupby(recent['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+        cum = daily_pnl.cumsum()
+        max_dd = float((cum.cummax() - cum).max()) if not daily_pnl.empty else 0.0
+
+        if avg_pnl < 0 and profit_factor < 1.0:
+            state = 'monitor'
+            reason = (
+                f"Ultimi {trade_count} trade: avg PnL {avg_pnl:.2f} e PF {profit_factor:.2f}"
+            )
+        elif profit_factor < 0.6 and avg_pnl < 0 and max_dd > abs(total_pnl) * 0.5:
+            state = 'inhibited'
+            reason = (
+                f"BF PF {profit_factor:.2f} < 0.6 e DD recente {max_dd:.2f}"
+            )
+        else:
+            state = 'healthy'
+            reason = (
+                f"Ultimi {trade_count} trade: avg PnL {avg_pnl:.2f}, PF {profit_factor:.2f}"
+            )
+
+        rows.append({
+            'Strategy': str(strat),
+            'state': state,
+            'reason': reason,
+            'rolling_trade_count': int(trade_count),
+            'total_pnl': total_pnl,
+            'avg_pnl': avg_pnl,
+            'profit_factor': profit_factor,
+            'max_dd': max_dd,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def rule_rolling_underperf_weekday(
+    final_oos_df: pd.DataFrame,
+    rolling_trades: int = 20,
+) -> pd.DataFrame:
+    """Segnala coppie Strategy × weekday sulla base degli ultimi N trade di quel weekday."""
+    if final_oos_df is None or final_oos_df.empty:
+        return pd.DataFrame(columns=[
+            'Strategy', 'weekday_open', 'state', 'reason',
+            'rolling_trade_count', 'total_pnl', 'avg_pnl', 'profit_factor', 'max_dd',
+        ])
+
+    rows = []
+    df = final_oos_df.copy()
+    df['weekday_open'] = df['weekday_open'].apply(_normalize_weekday_name)
+    for (strat, wd), group in df.groupby(['Strategy', 'weekday_open']):
+        group = group.sort_values('Date Closed')
+        if len(group) < rolling_trades:
+            continue
+        recent = group.tail(rolling_trades)
+        trade_count = len(recent)
+        total_pnl = float(recent['Weighted Net PnL'].sum())
+        avg_pnl = float(recent['Weighted Net PnL'].mean())
+        profit_factor = _compute_profit_factor(recent['Weighted Net PnL'])
+        daily_pnl = recent.groupby(recent['Date Closed'].dt.date)['Weighted Net PnL'].sum()
+        cum = daily_pnl.cumsum()
+        max_dd = float((cum.cummax() - cum).max()) if not daily_pnl.empty else 0.0
+
+        if avg_pnl < 0 and profit_factor < 1.0:
+            state = 'monitor'
+            reason = (
+                f"Ultimi {trade_count} trade su {wd}: avg PnL {avg_pnl:.2f}, PF {profit_factor:.2f}"
+            )
+        elif profit_factor < 0.6 and avg_pnl < 0 and max_dd > abs(total_pnl) * 0.5:
+            state = 'inhibited'
+            reason = (
+                f"Ultimi {trade_count} trade su {wd}: PF {profit_factor:.2f} < 0.6"
+            )
+        else:
+            state = 'healthy'
+            reason = (
+                f"Ultimi {trade_count} trade su {wd}: avg PnL {avg_pnl:.2f}, PF {profit_factor:.2f}"
+            )
+
+        rows.append({
+            'Strategy': str(strat),
+            'weekday_open': wd,
+            'state': state,
+            'reason': reason,
+            'rolling_trade_count': int(trade_count),
+            'total_pnl': total_pnl,
+            'avg_pnl': avg_pnl,
+            'profit_factor': profit_factor,
+            'max_dd': max_dd,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def rule_risk_budget_weekday(
+    final_oos_df: pd.DataFrame,
+    risk_budget_pct: float = 0.30,
+) -> pd.DataFrame:
+    """Controlla la concentrazione di rischio su singoli weekday a livello di portafoglio."""
+    if final_oos_df is None or final_oos_df.empty:
+        return pd.DataFrame(columns=[
+            'Strategy', 'weekday_open', 'state', 'reason',
+            'weekday_risk_share', 'profit_factor', 'trade_count', 'total_pnl',
+        ])
+
+    df = final_oos_df.copy()
+    df['weekday_open'] = df['weekday_open'].apply(_normalize_weekday_name)
+    df['risk_proxy'] = df['Weighted Net PnL'].abs()
+    total_risk = float(df['risk_proxy'].sum())
+    if total_risk <= 0:
+        return pd.DataFrame(columns=[
+            'Strategy', 'weekday_open', 'state', 'reason',
+            'weekday_risk_share', 'profit_factor', 'trade_count', 'total_pnl',
+        ])
+
+    weekday_risk = df.groupby('weekday_open')['risk_proxy'].sum().to_dict()
+    rows = []
+    for (strat, wd), group in df.groupby(['Strategy', 'weekday_open']):
+        trade_count = len(group)
+        total_pnl = float(group['Weighted Net PnL'].sum())
+        profit_factor = _compute_profit_factor(group['Weighted Net PnL'])
+        weekday_share = float(weekday_risk.get(wd, 0.0) / total_risk)
+
+        if weekday_share > risk_budget_pct * 1.5 and profit_factor < 0.8:
+            state = 'inhibited'
+            reason = (
+                f"Concentrazione {weekday_share:.1%} > {risk_budget_pct*1.5:.0%} e PF {profit_factor:.2f}"
+            )
+        elif weekday_share > risk_budget_pct and profit_factor < 1.0:
+            state = 'monitor'
+            reason = (
+                f"Concentrazione {weekday_share:.1%} > {risk_budget_pct:.0%}"
+            )
+        else:
+            state = 'healthy'
+            reason = f"Concentrazione {weekday_share:.1%}, PF {profit_factor:.2f}"
+
+        rows.append({
+            'Strategy': str(strat),
+            'weekday_open': wd,
+            'state': state,
+            'reason': reason,
+            'weekday_risk_share': weekday_share,
+            'profit_factor': profit_factor,
+            'trade_count': int(trade_count),
+            'total_pnl': total_pnl,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def run_sanity_check(
+    final_oos_df: pd.DataFrame,
+    ec_enabled: bool,
+    ec_capital_mode: str,
+    ec_p80: float,
+    ec_p90: float,
+    ec_p95: float,
+    rolling_trades: int = 20,
+    risk_budget_pct: float = 0.30,
+    thresholds_by_strategy=None,
+) -> dict:
+    """Esegue tutte le regole di sanity check e restituisce i riassunti e il log."""
+    if final_oos_df is None or final_oos_df.empty:
+        return {
+            'strategy_summary_df': pd.DataFrame(),
+            'weekday_summary_df': pd.DataFrame(),
+            'inhibition_log_df': pd.DataFrame(),
+        }
+
+    df = final_oos_df.copy()
+    df['weekday_open'] = df['weekday_open'].apply(_normalize_weekday_name)
+
+    dd_state_df = rule_dd_equity_control_strategy(
+        df, ec_enabled, ec_capital_mode, ec_p80, ec_p90, ec_p95,
+        thresholds_by_strategy=thresholds_by_strategy,
+    )
+    weekday_state_df = rule_weekday_performance(df)
+    rolling_strategy_df = rule_rolling_underperf_strategy(df, rolling_trades=rolling_trades)
+    rolling_weekday_df = rule_rolling_underperf_weekday(df, rolling_trades=rolling_trades)
+    risk_budget_df = rule_risk_budget_weekday(df, risk_budget_pct=risk_budget_pct)
+
+    severity = {'healthy': 0, 'monitor': 1, 'inhibited': 2}
+
+    strategy_aggregate = df.groupby('Strategy').agg(
+        trade_count=('Weighted Net PnL', 'count'),
+        total_pnl=('Weighted Net PnL', 'sum'),
+    ).reset_index()
+    strategy_aggregate['max_dd'] = strategy_aggregate['Strategy'].map(
+        lambda strat: float((
+            df[df['Strategy'] == strat]
+            .groupby(df['Date Closed'].dt.date)['Weighted Net PnL']
+            .sum().cumsum().pipe(lambda s: s.cummax() - s).max()
+        ) if not df[df['Strategy'] == strat].empty else 0.0)
+    )
+
+    strategy_rows = []
+    for _, row in strategy_aggregate.iterrows():
+        strat = row['Strategy']
+        state_values = []
+        reasons = []
+
+        for summary_df in (dd_state_df, rolling_strategy_df):
+            match = summary_df[summary_df['Strategy'] == strat]
+            if not match.empty:
+                state_values.append(str(match.iloc[0]['state']))
+                reasons.append(str(match.iloc[0]['reason']))
+
+        if not state_values:
+            state = 'healthy'
+        else:
+            state = max(state_values, key=lambda s: severity.get(s, 0))
+
+        reason = ' | '.join([r for r in reasons if r])
+        strategy_rows.append({
+            'Strategy': strat,
+            'state': state,
+            'reason': reason,
+            'trade_count': int(row['trade_count']),
+            'total_pnl': float(row['total_pnl']),
+            'max_dd': float(row['max_dd']),
+        })
+
+    strategy_summary_df = pd.DataFrame(strategy_rows)
+
+    weekday_aggregate = (
+        df.groupby(['Strategy', 'weekday_open'])['Weighted Net PnL']
+        .agg(trade_count='count', total_pnl='sum')
+        .reset_index()
+    )
+    weekday_aggregate['profit_factor'] = weekday_aggregate.apply(
+        lambda r: _compute_profit_factor(
+            df[(df['Strategy'] == r['Strategy']) & (df['weekday_open'] == r['weekday_open'])]['Weighted Net PnL']
+        ), axis=1
+    )
+    weekday_aggregate['max_dd'] = weekday_aggregate.apply(
+        lambda r: float((
+            df[(df['Strategy'] == r['Strategy']) & (df['weekday_open'] == r['weekday_open'])]
+            .groupby(df['Date Closed'].dt.date)['Weighted Net PnL']
+            .sum().cumsum().pipe(lambda s: s.cummax() - s).max()
+        ) if not df[(df['Strategy'] == r['Strategy']) & (df['weekday_open'] == r['weekday_open'])].empty else 0.0), axis=1
+    )
+
+    weekday_rows = []
+    for _, row in weekday_aggregate.iterrows():
+        strat = row['Strategy']
+        wd = row['weekday_open']
+        state_values = []
+        reasons = []
+        for summary_df in (weekday_state_df, rolling_weekday_df, risk_budget_df):
+            match = summary_df[
+                (summary_df['Strategy'] == strat) &
+                (summary_df['weekday_open'] == wd)
+            ]
+            if not match.empty:
+                state_values.append(str(match.iloc[0]['state']))
+                reasons.append(str(match.iloc[0]['reason']))
+
+        if not state_values:
+            state = 'healthy'
+        else:
+            state = max(state_values, key=lambda s: severity.get(s, 0))
+
+        reason = ' | '.join([r for r in reasons if r])
+        weekday_rows.append({
+            'Strategy': strat,
+            'weekday_open': wd,
+            'state': state,
+            'reason': reason,
+            'trade_count': int(row['trade_count']),
+            'total_pnl': float(row['total_pnl']),
+            'profit_factor': float(row['profit_factor']),
+            'max_dd': float(row['max_dd']),
+        })
+
+    weekday_summary_df = pd.DataFrame(weekday_rows)
+
+    log_rows = []
+    rule_sources = [
+        (dd_state_df, 'DD_EC_STRATEGY'),
+        (weekday_state_df, 'WEEKDAY_PERFORMANCE'),
+        (rolling_strategy_df, 'ROLLING_UNDERPERF_STRATEGY'),
+        (rolling_weekday_df, 'ROLLING_UNDERPERF_WEEKDAY'),
+        (risk_budget_df, 'RISK_BUDGET_WEEKDAY'),
+    ]
+    for df_rule, rule_id in rule_sources:
+        if df_rule is None or df_rule.empty:
+            continue
+        for _, row in df_rule.iterrows():
+            state = str(row.get('state', 'healthy'))
+            if state == 'healthy':
+                continue
+            log_rows.append({
+                'Strategy': row.get('Strategy'),
+                'weekday_open': row.get('weekday_open', None),
+                'rule_id': rule_id,
+                'state': state,
+                'first_trigger_date': pd.NaT,
+                'reason': row.get('reason', ''),
+            })
+
+    inhibition_log_df = pd.DataFrame(log_rows)
+    return {
+        'strategy_summary_df': strategy_summary_df,
+        'weekday_summary_df': weekday_summary_df,
+        'inhibition_log_df': inhibition_log_df,
+    }
+
+
+def simulate_sanity_scenario(
+    final_oos_df: pd.DataFrame,
+    disabled_strategies=None,
+    disabled_strategy_weekdays=None,
+):
+    """Applica inibizioni manuali e restituisce i trade soppressi e il log."""
+    if final_oos_df is None or final_oos_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    disabled_strategies = disabled_strategies or []
+    disabled_strategy_weekdays = disabled_strategy_weekdays or []
+    normalized_pairs = [
+        (str(strat), _normalize_weekday_name(wd)) for strat, wd in disabled_strategy_weekdays
+    ]
+
+    df = final_oos_df.copy()
+    df['weekday_open_name'] = df['weekday_open'].apply(_normalize_weekday_name)
+    mask = df['Strategy'].isin(disabled_strategies)
+    if normalized_pairs:
+        pair_keys = set(normalized_pairs)
+        mask = mask | df.apply(
+            lambda row: (row['Strategy'], row['weekday_open_name']) in pair_keys,
+            axis=1,
+        )
+
+    scenario_df = df[~mask].drop(columns=['weekday_open_name']) if not df.empty else df.copy()
+
+    log_rows = []
+    if disabled_strategies:
+        removed = df[df['Strategy'].isin(disabled_strategies)]
+        for strat in sorted(set(disabled_strategies)):
+            subset = removed[removed['Strategy'] == strat]
+            if subset.empty:
+                continue
+            log_rows.append({
+                'Strategy': strat,
+                'weekday_open': None,
+                'trade_removed': int(len(subset)),
+                'pnl_removed': float(subset['Weighted Net PnL'].sum()),
+                'reason': 'Strategia inibita manualmente',
+            })
+
+    if normalized_pairs:
+        for strat, wd in normalized_pairs:
+            subset = df[~df['Strategy'].isin(disabled_strategies)]
+            subset = subset[(subset['Strategy'] == strat) & (subset['weekday_open_name'] == wd)]
+            if subset.empty:
+                continue
+            log_rows.append({
+                'Strategy': strat,
+                'weekday_open': wd,
+                'trade_removed': int(len(subset)),
+                'pnl_removed': float(subset['Weighted Net PnL'].sum()),
+                'reason': 'Strategy × weekday inibito manualmente',
+            })
+
+    scenario_log_df = pd.DataFrame(log_rows)
+    return scenario_df, scenario_log_df

@@ -31,6 +31,8 @@ from wfa_core import (
     compute_dd_percentiles_from_is,
     apply_equity_control,
     apply_portfolio_sizing,
+    run_sanity_check,
+    simulate_sanity_scenario,
 )
 from wfa_optimizer_module import render_optimizer_tab, run_wfa_single_windowed, WFAParams
 from wfa_sizing import (
@@ -241,6 +243,292 @@ def render_metrics(m, label):
     r4[1].metric("Best Day",      f"${m['Best Day ($)']:,.2f}")
     r4[2].metric("Worst Day",     f"${m['Worst Day ($)']:,.2f}")
 
+
+def _sanity_state_to_label(state: str) -> str:
+    mapping = {
+        "healthy": "🟢 Sano",
+        "monitor": "🟡 Monitorare",
+        "inhibited": "🔴 Inibito",
+    }
+    return mapping.get(str(state).lower(), "⚪ N/D")
+
+
+def _sanity_state_to_style(val: str) -> str:
+    txt = str(val).lower()
+    if "inibito" in txt or "inhibited" in txt:
+        return "background-color: rgba(239,68,68,0.18); color:#fecaca; font-weight:700;"
+    if "monitor" in txt:
+        return "background-color: rgba(245,158,11,0.18); color:#fde68a; font-weight:700;"
+    if "sano" in txt or "healthy" in txt:
+        return "background-color: rgba(34,197,94,0.16); color:#bbf7d0; font-weight:700;"
+    return ""
+
+
+def _build_sanity_traffic_matrix(
+    strategy_summary_df: pd.DataFrame,
+    weekday_summary_df: pd.DataFrame,
+    giorni_settimana: list[str],
+) -> pd.DataFrame:
+    if strategy_summary_df.empty and weekday_summary_df.empty:
+        return pd.DataFrame()
+
+    if not weekday_summary_df.empty:
+        pivot = (
+            weekday_summary_df
+            .pivot(index="Strategy", columns="weekday_open", values="state")
+            .reindex(columns=giorni_settimana)
+        )
+        pivot = pivot.fillna("healthy")
+    else:
+        pivot = pd.DataFrame(index=strategy_summary_df["Strategy"].unique(), columns=giorni_settimana)
+        pivot[:] = "healthy"
+
+    if not strategy_summary_df.empty:
+        strat_states = strategy_summary_df.set_index("Strategy")["state"]
+        pivot["Totale"] = pivot.index.map(strat_states.get).fillna("healthy")
+    else:
+        pivot["Totale"] = "healthy"
+
+    traffic_df = pivot.applymap(_sanity_state_to_label)
+    traffic_df.index.name = "Strategy"
+    return traffic_df
+
+
+def _build_equity_curve(df_in: pd.DataFrame) -> pd.DataFrame:
+    if df_in is None or df_in.empty:
+        return pd.DataFrame(columns=["Date", "Daily PnL", "Cumulative PnL"])
+    grouped = (
+        df_in.groupby(df_in["Date Closed"].dt.date)["Weighted Net PnL"]
+        .sum()
+        .reset_index()
+        .rename(columns={"Date Closed": "Date", "Weighted Net PnL": "Daily PnL"})
+    )
+    grouped["Date"] = pd.to_datetime(grouped["Date"])
+    grouped["Cumulative PnL"] = grouped["Daily PnL"].cumsum()
+    return grouped
+
+
+def _render_sanity_section(
+    final_oos_df: pd.DataFrame,
+    ec_enabled: bool,
+    ec_capital_mode: str,
+    ec_p80: float,
+    ec_p90: float,
+    ec_p95: float,
+):
+    if final_oos_df is None or final_oos_df.empty:
+        return
+
+    sanity_results = run_sanity_check(
+        final_oos_df=final_oos_df,
+        ec_enabled=ec_enabled,
+        ec_capital_mode=ec_capital_mode,
+        ec_p80=ec_p80,
+        ec_p90=ec_p90,
+        ec_p95=ec_p95,
+    )
+
+    strategy_summary_df = sanity_results["strategy_summary_df"]
+    weekday_summary_df = sanity_results["weekday_summary_df"]
+    inhibition_log_df = sanity_results["inhibition_log_df"]
+
+    st.divider()
+    st.header("🧪 Sanity Check / Equity Control")
+
+    st.subheader("Matrice strategia × weekday")
+    traffic_df = _build_sanity_traffic_matrix(
+        strategy_summary_df=strategy_summary_df,
+        weekday_summary_df=weekday_summary_df,
+        giorni_settimana=GIORNI_SETTIMANA,
+    )
+    if not traffic_df.empty:
+        styled = traffic_df.style.applymap(_sanity_state_to_style)
+        st.dataframe(styled, use_container_width=True, height=480)
+    else:
+        st.info("Nessun dato disponibile per il Sanity Check.")
+        return
+
+    st.subheader("Drill-down cella")
+    strategies = sorted(traffic_df.index.tolist())
+    col1, col2 = st.columns(2)
+    with col1:
+        selected_strategy = st.selectbox(
+            "Strategia",
+            options=strategies,
+            index=0,
+            key="sanity_selected_strategy",
+        )
+    with col2:
+        scope_options = ["Totale strategia"] + list(GIORNI_SETTIMANA)
+        selected_scope = st.selectbox(
+            "Ambito",
+            options=scope_options,
+            index=0,
+            key="sanity_selected_scope",
+        )
+
+    detail_df = None
+    drill_state = "N/D"
+    drill_reason = ""
+    trade_count = 0
+    total_pnl = 0.0
+    max_dd = 0.0
+
+    if selected_scope == "Totale strategia":
+        row = strategy_summary_df[strategy_summary_df["Strategy"] == selected_strategy]
+        if not row.empty:
+            r = row.iloc[0]
+            drill_state = _sanity_state_to_label(r["state"])
+            drill_reason = r.get("reason", "")
+            trade_count = int(r.get("trade_count", 0))
+            total_pnl = float(r.get("total_pnl", 0.0))
+            max_dd = float(r.get("max_dd", 0.0))
+        if inhibition_log_df is not None and not inhibition_log_df.empty:
+            detail_df = inhibition_log_df[inhibition_log_df["Strategy"] == selected_strategy]
+    else:
+        wd = selected_scope
+        row = weekday_summary_df[
+            (weekday_summary_df["Strategy"] == selected_strategy)
+            & (weekday_summary_df["weekday_open"] == wd)
+        ]
+        if not row.empty:
+            r = row.iloc[0]
+            drill_state = _sanity_state_to_label(r["state"])
+            drill_reason = r.get("reason", "")
+            trade_count = int(r.get("trade_count", 0))
+            total_pnl = float(r.get("total_pnl", 0.0))
+            max_dd = float(r.get("max_dd", 0.0))
+        if inhibition_log_df is not None and not inhibition_log_df.empty:
+            detail_df = inhibition_log_df[
+                (inhibition_log_df["Strategy"] == selected_strategy)
+                & (inhibition_log_df["weekday_open"] == wd)
+            ]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Stato", drill_state)
+    m2.metric("Trade", int(trade_count))
+    m3.metric("PnL", f"${total_pnl:,.2f}")
+    m4.metric("Max DD", f"${max_dd:,.2f}")
+
+    if drill_reason:
+        st.info(f"Reason: {drill_reason}")
+
+    if detail_df is not None and not detail_df.empty:
+        with st.expander("Dettaglio regole / inibizioni", expanded=False):
+            st.dataframe(detail_df, use_container_width=True)
+
+    st.subheader("Simulazione what-if")
+    all_strategy_options = sorted(final_oos_df["Strategy"].dropna().unique().tolist())
+    weekday_keys_series = (
+        weekday_summary_df.assign(
+            key=lambda x: x["Strategy"].astype(str) + " | " + x["weekday_open"].astype(str)
+        )["key"]
+        .drop_duplicates()
+        .sort_values()
+    )
+    all_weekday_keys = weekday_keys_series.tolist()
+
+    wf1, wf2 = st.columns(2)
+    with wf1:
+        disabled_strategies = st.multiselect(
+            "Inibisci strategie complete",
+            options=all_strategy_options,
+            default=st.session_state.get("sanity_disabled_strategies_wf", []),
+            key="sanity_disabled_strategies_wf",
+        )
+    with wf2:
+        disabled_weekday_keys = st.multiselect(
+            "Inibisci strategy × weekday",
+            options=all_weekday_keys,
+            default=st.session_state.get("sanity_disabled_weekdays_wf", []),
+            key="sanity_disabled_weekdays_wf",
+        )
+
+    disabled_strategy_weekdays = []
+    for k in disabled_weekday_keys:
+        if " | " in k:
+            strat, wd = k.split(" | ", 1)
+            disabled_strategy_weekdays.append((strat, wd))
+
+    scenario_df, scenario_log_df = simulate_sanity_scenario(
+        final_oos_df=final_oos_df,
+        disabled_strategies=disabled_strategies,
+        disabled_strategy_weekdays=disabled_strategy_weekdays,
+    )
+
+    baseline_metrics = calculate_metrics(final_oos_df)
+    scenario_metrics = calculate_metrics(scenario_df)
+
+    comparison_small = pd.DataFrame([
+        {
+            "Scenario": "Baseline",
+            "PnL": baseline_metrics.get("Total Weighted PnL", 0),
+            "Max DD": baseline_metrics.get("Max Drawdown ($)", 0),
+            "PF": baseline_metrics.get("Profit Factor", 0),
+            "Sharpe": baseline_metrics.get("Sharpe Ratio", 0),
+            "Trade": baseline_metrics.get("Total Trades", 0),
+            "Win Rate": baseline_metrics.get("Win Rate", 0),
+        },
+        {
+            "Scenario": "What-if",
+            "PnL": scenario_metrics.get("Total Weighted PnL", 0),
+            "Max DD": scenario_metrics.get("Max Drawdown ($)", 0),
+            "PF": scenario_metrics.get("Profit Factor", 0),
+            "Sharpe": scenario_metrics.get("Sharpe Ratio", 0),
+            "Trade": scenario_metrics.get("Total Trades", 0),
+            "Win Rate": scenario_metrics.get("Win Rate", 0),
+        },
+    ])
+
+    st.markdown("**Confronto metriche**")
+    st.dataframe(comparison_small, use_container_width=True)
+
+    baseline_equity_df = _build_equity_curve(final_oos_df)
+    scenario_equity_df = _build_equity_curve(scenario_df)
+
+    fig_sanity = go.Figure()
+    fig_sanity.add_trace(go.Scatter(
+        x=baseline_equity_df["Date"],
+        y=baseline_equity_df["Cumulative PnL"],
+        mode='lines',
+        name='Baseline',
+        line=dict(color='#00d4ff', width=2),
+    ))
+    fig_sanity.add_trace(go.Scatter(
+        x=scenario_equity_df["Date"],
+        y=scenario_equity_df["Cumulative PnL"],
+        mode='lines',
+        name='What-if',
+        line=dict(color='#22c55e', width=2),
+    ))
+    fig_sanity.update_layout(title='Equity line: baseline vs what-if', **OZONE_LAYOUT)
+    st.plotly_chart(fig_sanity, use_container_width=True)
+
+    scenario_equity_csv = scenario_equity_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📥 Scarica equity CSV scenario",
+        data=scenario_equity_csv,
+        file_name="equity_sanity_scenario.csv",
+        mime="text/csv",
+    )
+
+    scenario_trades_csv = scenario_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📥 Scarica trade CSV scenario",
+        data=scenario_trades_csv,
+        file_name="wfa_oos_trades_sanity_scenario.csv",
+        mime="text/csv",
+    )
+
+    if scenario_log_df is not None and not scenario_log_df.empty:
+        scenario_log_csv = scenario_log_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="📥 Scarica log inibizioni CSV",
+            data=scenario_log_csv,
+            file_name="sanity_inhibition_log.csv",
+            mime="text/csv",
+        )
+
 # ─── FUNZIONI JSON CONFIG ─────────────────────────────────────────────────────
 def build_config_payload():
     return {
@@ -329,7 +617,11 @@ _SS_DEFAULTS = {
     "sizing_compounding":        DEFAULT_COMPOUNDING,
     "sizing_strategy_configs":   {},
     "max_per_group":      DEFAULT_MAX_PER_GROUP,
-    "disabled_strategies": [],   # ← AGGIUNTO
+    "disabled_strategies": [],
+    "sanity_selected_strategy": None,
+    "sanity_selected_scope": "Totale strategia",
+    "sanity_disabled_strategies_wf": [],
+    "sanity_disabled_weekdays_wf": [],
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -1202,6 +1494,16 @@ if uploaded_file is not None:
                         "\u2139\ufe0f Dati `selected_strategies` non disponibili per questa run. "
                         "Riesegui la simulazione WFA per visualizzare il grafico."
                     )
+
+            # ─── SEZIONE 7: SANITY CHECK & EQUITY CONTROL ───────────────────
+            _render_sanity_section(
+                final_oos_df=final_oos_df,
+                ec_enabled=ec_enabled,
+                ec_capital_mode=ec_capital_mode,
+                ec_p80=ec_p80,
+                ec_p90=ec_p90,
+                ec_p95=ec_p95,
+            )
 
     # ─── TAB OTTIMIZZATORE ────────────────────────────────────────────────────
     with tab_opt:
